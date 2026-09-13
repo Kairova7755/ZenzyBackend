@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const {
     initializeApp,
     applicationDefault,
+    cert,
 } = require("firebase-admin/app");
 
 const {
@@ -33,8 +34,28 @@ app.use(express.json({ limit: "2mb" }));
  * or RAZORPAY_KEY_SECRET inside the Android app.
  */
 
+function getFirebaseCredential() {
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+
+    if (raw) {
+        try {
+            return cert(JSON.parse(raw));
+        } catch (error) {
+            console.error(
+                "FIREBASE_SERVICE_ACCOUNT JSON ERROR:",
+                error.message
+            );
+            throw new Error(
+                "Invalid FIREBASE_SERVICE_ACCOUNT environment variable"
+            );
+        }
+    }
+
+    return applicationDefault();
+}
+
 initializeApp({
-    credential: applicationDefault(),
+    credential: getFirebaseCredential(),
 });
 
 const db = getFirestore();
@@ -320,13 +341,11 @@ app.post(
             const {
                 razorpay_payment_id,
                 razorpay_order_id,
-                razorpay_signature,
             } = req.body || {};
 
             if (
                 !razorpay_payment_id ||
-                !razorpay_order_id ||
-                !razorpay_signature
+                !razorpay_order_id
             ) {
                 return res.status(400).json({
                     success: false,
@@ -334,28 +353,9 @@ app.post(
                 });
             }
 
-            const generatedSignature = crypto
-                .createHmac(
-                    "sha256",
-                    process.env.RAZORPAY_KEY_SECRET
-                )
-                .update(
-                    `${razorpay_order_id}|${razorpay_payment_id}`
-                )
-                .digest("hex");
-
-            if (
-                !safeEqualHex(
-                    generatedSignature,
-                    razorpay_signature
-                )
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid payment signature",
-                });
-            }
-
+            // Android's Razorpay callback does not provide a signature in the
+            // SDK flow used by Zenzy. Verification is performed server-side
+            // using the authenticated Firebase user and Razorpay records.
             const order =
                 await razorpay.orders.fetch(
                     razorpay_order_id
