@@ -24,7 +24,12 @@ const {
 const app = express();
 
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use((req, res, next) => {
+    if (req.path === "/razorpay-webhook") {
+        return next();
+    }
+    return express.json({ limit: "2mb" })(req, res, next);
+});
 
 /*
  * --------------------------------------------------------------------------
@@ -167,6 +172,27 @@ function getProduct(productId) {
     return PRODUCTS[productId] || null;
 }
 
+const SUBSCRIPTION_PLAN_IDS = {
+    monthly: process.env.RAZORPAY_MONTHLY_PLAN_ID || "",
+    yearly: process.env.RAZORPAY_YEARLY_PLAN_ID || "",
+};
+
+function getSubscriptionPlanId(productId) {
+    return SUBSCRIPTION_PLAN_IDS[productId] || null;
+}
+
+function getSubscriptionStartAt(product) {
+    const start = new Date();
+
+    if (product.trialDays) {
+        start.setDate(start.getDate() + product.trialDays);
+    } else if (product.renewalMonths) {
+        start.setMonth(start.getMonth() + product.renewalMonths);
+    }
+
+    return Math.floor(start.getTime() / 1000);
+}
+
 function rupeesToPaise(rupees) {
     return Math.round(Number(rupees) * 100);
 }
@@ -251,76 +277,470 @@ app.get("/", (req, res) => {
 
 /*
  * --------------------------------------------------------------------------
- * Create Razorpay Order
+ * Razorpay Subscription Webhook
  * --------------------------------------------------------------------------
- * Sensitive: authenticated users only.
+ * Razorpay sends subscription lifecycle events and renewal charge events to
+ * this endpoint. The raw request body is used for webhook signature checks.
+ * Configure this URL in Razorpay Dashboard:
+ *   https://YOUR-DOMAIN/razorpay-webhook
  *
- * The server chooses price/reward from PRODUCTS.
- * The Android client cannot change the amount or number of A-Coins by
- * editing its request body.
+ * Recommended events:
+ *   subscription.authenticated
+ *   subscription.activated
+ *   subscription.charged
+ *   subscription.pending
+ *   subscription.halted
+ *   subscription.cancelled
+ *   subscription.completed
  */
 
 app.post(
-    "/create-order",
-    requireFirebaseUser,
+    "/razorpay-webhook",
+    express.raw({ type: "application/json", limit: "2mb" }),
     async (req, res) => {
         try {
-            const { productId } = req.body || {};
+            const webhookSecret =
+                process.env.RAZORPAY_WEBHOOK_SECRET || "";
 
-            const uid = req.uid;
+            if (!webhookSecret) {
+                console.error("RAZORPAY_WEBHOOK_SECRET is missing");
+                return res.status(500).json({
+                    success: false,
+                    message: "Webhook secret is not configured",
+                });
+            }
+
+            const signature =
+                req.headers["x-razorpay-signature"];
+
+            if (!signature || !Buffer.isBuffer(req.body)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid webhook request",
+                });
+            }
+
+            const expectedSignature = crypto
+                .createHmac("sha256", webhookSecret)
+                .update(req.body)
+                .digest("hex");
+
+            if (!safeEqualHex(expectedSignature, signature)) {
+                console.error(
+                    "RAZORPAY WEBHOOK SIGNATURE MISMATCH"
+                );
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid webhook signature",
+                });
+            }
+
+            let event;
+
+            try {
+                event = JSON.parse(req.body.toString("utf8"));
+            } catch (error) {
+                console.error(
+                    "RAZORPAY WEBHOOK JSON ERROR:",
+                    error.message
+                );
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid webhook JSON",
+                });
+            }
+
+            const eventName = event.event || "";
+            const subscriptionEntity =
+                event.payload?.subscription?.entity || null;
+            const paymentEntity =
+                event.payload?.payment?.entity || null;
+
+            if (!subscriptionEntity?.id) {
+                return res.json({
+                    success: true,
+                    ignored: true,
+                    message:
+                        "Webhook received without subscription data",
+                });
+            }
+
+            const subscriptionId = subscriptionEntity.id;
+            const subscriptionRef = db
+                .collection("subscriptions")
+                .doc(subscriptionId);
+
+            const existingSubscription =
+                await subscriptionRef.get();
+
+            const existingData = existingSubscription.exists
+                ? existingSubscription.data() || {}
+                : {};
+
+            const notes =
+                subscriptionEntity.notes || {};
+
+            const uid =
+                existingData.uid || notes.uid || null;
+            const productId =
+                existingData.productId || notes.productId || null;
+
+            if (!uid || !productId) {
+                console.error(
+                    "WEBHOOK SUBSCRIPTION CONTEXT MISSING:",
+                    subscriptionId
+                );
+                return res.status(400).json({
+                    success: false,
+                    message: "Subscription context missing",
+                });
+            }
+
             const product = getProduct(productId);
 
-            if (!product) {
+            if (!product || product.type !== "premium") {
                 return res.status(400).json({
                     success: false,
-                    message: "Invalid Zenzy product",
+                    message: "Invalid subscription product",
                 });
             }
 
-            const amount = rupeesToPaise(
-                product.amountRupees
+            const userRef = db
+                .collection("users")
+                .doc(uid);
+
+            if (eventName === "subscription.charged") {
+                const paymentId = paymentEntity?.id;
+
+                if (!paymentId) {
+                    return res.status(400).json({
+                        success: false,
+                        message:
+                            "Subscription charged webhook has no payment ID",
+                    });
+                }
+
+                const expectedRenewalAmount =
+                    rupeesToPaise(
+                        product.renewalAmountRupees
+                    );
+
+                if (
+                    Number(paymentEntity.amount) !==
+                    expectedRenewalAmount
+                ) {
+                    console.error(
+                        "WEBHOOK RENEWAL AMOUNT MISMATCH:",
+                        {
+                            subscriptionId,
+                            paymentId,
+                            received: paymentEntity.amount,
+                            expected: expectedRenewalAmount,
+                        }
+                    );
+                    return res.status(400).json({
+                        success: false,
+                        message: "Renewal amount mismatch",
+                    });
+                }
+
+                const paymentRef = db
+                    .collection("payments")
+                    .doc(paymentId);
+
+                await db.runTransaction(
+                    async (transaction) => {
+                        const paymentSnapshot =
+                            await transaction.get(
+                                paymentRef
+                            );
+
+                        if (paymentSnapshot.exists) {
+                            return;
+                        }
+
+                        const userSnapshot =
+                            await transaction.get(
+                                userRef
+                            );
+
+                        if (!userSnapshot.exists) {
+                            throw new Error(
+                                "USER_NOT_FOUND"
+                            );
+                        }
+
+                        const userData =
+                            userSnapshot.data() || {};
+
+                        const currentCoins = Math.max(
+                            0,
+                            Number(
+                                userData.aCoins || 0
+                            )
+                        );
+
+                        const paymentRecord = {
+                            uid,
+                            productId,
+                            productType:
+                                "premium_renewal",
+                            productName:
+                                product.name,
+                            amountRupees:
+                                product.renewalAmountRupees,
+                            amountPaise:
+                                expectedRenewalAmount,
+                            aCoinReward:
+                                product.aCoinReward,
+                            razorpayPaymentId:
+                                paymentId,
+                            razorpaySubscriptionId:
+                                subscriptionId,
+                            paymentStatus:
+                                paymentEntity.status ||
+                                "captured",
+                            processedAt:
+                                FieldValue.serverTimestamp(),
+                        };
+
+                        transaction.set(
+                            userRef,
+                            {
+                                aCoins:
+                                    currentCoins +
+                                    product.aCoinReward,
+                                isPremium: true,
+                                plan:
+                                    productId ===
+                                    "monthly"
+                                        ? "MONTHLY"
+                                        : "YEARLY",
+                                updatedAt:
+                                    FieldValue.serverTimestamp(),
+                            },
+                            { merge: true }
+                        );
+
+                        transaction.set(
+                            paymentRef,
+                            paymentRecord
+                        );
+
+                        transaction.set(
+                            subscriptionRef,
+                            {
+                                uid,
+                                productId,
+                                productName:
+                                    product.name,
+                                razorpaySubscriptionId:
+                                    subscriptionId,
+                                razorpayPlanId:
+                                    subscriptionEntity.plan_id ||
+                                    existingData.razorpayPlanId ||
+                                    null,
+                                status:
+                                    subscriptionEntity.status ||
+                                    "active",
+                                paidCount:
+                                    subscriptionEntity.paid_count ??
+                                    null,
+                                remainingCount:
+                                    subscriptionEntity.remaining_count ??
+                                    null,
+                                lastPaymentId:
+                                    paymentId,
+                                lastRenewalAmountRupees:
+                                    product.renewalAmountRupees,
+                                nextChargeDate:
+                                    subscriptionEntity.charge_at
+                                        ? Timestamp.fromMillis(
+                                            Number(
+                                                subscriptionEntity.charge_at
+                                            ) * 1000
+                                        )
+                                        : null,
+                                currentStart:
+                                    subscriptionEntity.current_start
+                                        ? Timestamp.fromMillis(
+                                            Number(
+                                                subscriptionEntity.current_start
+                                            ) * 1000
+                                        )
+                                        : null,
+                                currentEnd:
+                                    subscriptionEntity.current_end
+                                        ? Timestamp.fromMillis(
+                                            Number(
+                                                subscriptionEntity.current_end
+                                            ) * 1000
+                                        )
+                                        : null,
+                                updatedAt:
+                                    FieldValue.serverTimestamp(),
+                            },
+                            { merge: true }
+                        );
+
+                        const notificationRef =
+                            userRef
+                                .collection(
+                                    "notifications"
+                                )
+                                .doc();
+
+                        transaction.set(
+                            notificationRef,
+                            {
+                                title:
+                                    "Premium Renewed",
+                                message:
+                                    `${product.name} renewed for ₹${product.renewalAmountRupees}. ` +
+                                    `${product.aCoinReward} A-Coins added.`,
+                                type: "premium_renewal",
+                                read: false,
+                                createdAt:
+                                    FieldValue.serverTimestamp(),
+                                razorpayPaymentId:
+                                    paymentId,
+                                razorpaySubscriptionId:
+                                    subscriptionId,
+                            }
+                        );
+                    }
+                );
+
+                return res.json({
+                    success: true,
+                    message:
+                        "Subscription renewal processed",
+                });
+            }
+
+            const subscriptionStatus =
+                subscriptionEntity.status || null;
+
+            const update = {
+                uid,
+                productId,
+                productName: product.name,
+                razorpaySubscriptionId:
+                    subscriptionId,
+                razorpayPlanId:
+                    subscriptionEntity.plan_id ||
+                    existingData.razorpayPlanId ||
+                    null,
+                status:
+                    subscriptionStatus,
+                customerId:
+                    subscriptionEntity.customer_id ||
+                    existingData.customerId ||
+                    null,
+                paidCount:
+                    subscriptionEntity.paid_count ??
+                    existingData.paidCount ??
+                    null,
+                remainingCount:
+                    subscriptionEntity.remaining_count ??
+                    existingData.remainingCount ??
+                    null,
+                nextChargeDate:
+                    subscriptionEntity.charge_at
+                        ? Timestamp.fromMillis(
+                            Number(
+                                subscriptionEntity.charge_at
+                            ) * 1000
+                        )
+                        : null,
+                currentStart:
+                    subscriptionEntity.current_start
+                        ? Timestamp.fromMillis(
+                            Number(
+                                subscriptionEntity.current_start
+                            ) * 1000
+                        )
+                        : null,
+                currentEnd:
+                    subscriptionEntity.current_end
+                        ? Timestamp.fromMillis(
+                            Number(
+                                subscriptionEntity.current_end
+                            ) * 1000
+                        )
+                        : null,
+                updatedAt:
+                    FieldValue.serverTimestamp(),
+            };
+
+            if (
+                eventName === "subscription.cancelled" ||
+                eventName === "subscription.completed" ||
+                eventName === "subscription.expired"
+            ) {
+                update.isPremium = false;
+                update.plan = "FREE";
+            }
+
+            await subscriptionRef.set(
+                update,
+                { merge: true }
             );
 
-            if (amount <= 0) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid product amount",
-                });
+            if (eventName === "subscription.halted") {
+                await userRef.set(
+                    {
+                        subscriptionStatus: "halted",
+                        updatedAt:
+                            FieldValue.serverTimestamp(),
+                    },
+                    { merge: true }
+                );
             }
 
-            const order = await razorpay.orders.create({
-                amount,
-                currency: "INR",
-                receipt:
-                    `zenzy_${productId}_${Date.now()}`
-                        .slice(0, 40),
-
-                notes: {
-                    uid,
-                    productId,
-                    app: "zenzy",
-                },
-            });
+            if (
+                eventName === "subscription.authenticated" ||
+                eventName === "subscription.activated"
+            ) {
+                await userRef.set(
+                    {
+                        isPremium: true,
+                        plan:
+                            productId === "monthly"
+                                ? "MONTHLY"
+                                : "YEARLY",
+                        subscriptionStatus:
+                            subscriptionStatus ||
+                            eventName,
+                        updatedAt:
+                            FieldValue.serverTimestamp(),
+                    },
+                    { merge: true }
+                );
+            }
 
             return res.json({
                 success: true,
-                orderId: order.id,
-                amount: order.amount,
-                currency: order.currency,
-                productId,
-                productType: product.type,
-                productName: product.name,
-                keyId: process.env.RAZORPAY_KEY_ID,
+                processed: true,
+                event: eventName,
             });
         } catch (error) {
             console.error(
-                "CREATE ORDER ERROR:",
+                "RAZORPAY WEBHOOK ERROR:",
                 error
             );
 
+            if (error.message === "USER_NOT_FOUND") {
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        "Zenzy user account not found",
+                });
+            }
+
             return res.status(500).json({
                 success: false,
-                message: "Unable to create payment order",
+                message: "Webhook processing failed",
             });
         }
     }
@@ -328,116 +748,260 @@ app.post(
 
 /*
  * --------------------------------------------------------------------------
- * Verify Payment + Credit A-Coin
+ * Create Razorpay Subscription
  * --------------------------------------------------------------------------
+ * Premium products use Razorpay Subscriptions.
  *
- * Sensitive: authenticated users only.
+ * Monthly:
+ *   ₹1 upfront/authentication amount now -> 3-day trial -> ₹499/month.
  *
- * Security checks:
+ * Yearly:
+ *   ₹1 upfront/authentication amount now -> 1-month trial -> ₹2100/year.
  *
- * 1. Firebase token identifies the user.
- * 2. Razorpay signature is verified with the server secret.
- * 3. The order is fetched from Razorpay.
- * 4. Order uid must equal the authenticated uid.
- * 5. Product comes from server-side PRODUCTS.
- * 6. Razorpay order/payment amount must equal the server price.
- * 7. Payment must be captured/authorized.
- * 8. Payment ID is transactionally deduplicated before A-Coin credit.
+ * The actual recurring billing amount comes from the Razorpay Plan, not from
+ * the Android client. The Android client only receives the subscription_id.
  */
 
 app.post(
-    "/verify-payment",
+    "/create-subscription",
+    requireFirebaseUser,
+    async (req, res) => {
+        try {
+            const { productId } = req.body || {};
+            const uid = req.uid;
+            const product = getProduct(productId);
+
+            if (!product || product.type !== "premium") {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid Premium subscription selected",
+                });
+            }
+
+            const planId =
+                getSubscriptionPlanId(productId);
+
+            if (!planId) {
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        productId === "monthly"
+                            ? "Monthly Razorpay Plan ID is not configured"
+                            : "Yearly Razorpay Plan ID is not configured",
+                });
+            }
+
+            const startAt =
+                getSubscriptionStartAt(product);
+
+            const subscription =
+                await razorpay.subscriptions.create({
+                    plan_id: planId,
+                    total_count:
+                        productId === "monthly"
+                            ? 1200
+                            : 30,
+                    quantity: 1,
+                    customer_notify: true,
+                    start_at: startAt,
+                    addons: [
+                        {
+                            item: {
+                                name:
+                                    `${product.name} Initial Payment`,
+                                amount:
+                                    rupeesToPaise(
+                                        product.amountRupees
+                                    ),
+                                currency: "INR",
+                                description:
+                                    "Initial payment and mandate authorisation",
+                            },
+                        },
+                    ],
+                    notes: {
+                        uid,
+                        productId,
+                        app: "zenzy",
+                    },
+                });
+
+            await db
+                .collection("subscriptions")
+                .doc(subscription.id)
+                .set(
+                    {
+                        uid,
+                        productId,
+                        productName: product.name,
+                        razorpaySubscriptionId:
+                            subscription.id,
+                        razorpayPlanId: planId,
+                        status: subscription.status,
+                        trialDays:
+                            product.trialDays || null,
+                        initialAmountRupees:
+                            product.amountRupees,
+                        renewalAmountRupees:
+                            product.renewalAmountRupees,
+                        aCoinReward:
+                            product.aCoinReward,
+                        startAt:
+                            Timestamp.fromMillis(
+                                startAt * 1000
+                            ),
+                        nextChargeDate:
+                            Timestamp.fromMillis(
+                                startAt * 1000
+                            ),
+                        createdAt:
+                            FieldValue.serverTimestamp(),
+                        updatedAt:
+                            FieldValue.serverTimestamp(),
+                    },
+                    { merge: true }
+                );
+
+            return res.json({
+                success: true,
+                subscriptionId: subscription.id,
+                keyId:
+                    process.env.RAZORPAY_KEY_ID,
+                amount:
+                    rupeesToPaise(
+                        product.amountRupees
+                    ),
+                currency: "INR",
+                productId,
+                productType: product.type,
+                productName: product.name,
+                trialDays:
+                    product.trialDays || null,
+                renewalAmount:
+                    product.renewalAmountRupees,
+                startAt,
+            });
+        } catch (error) {
+            console.error(
+                "CREATE SUBSCRIPTION ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    "Unable to create Premium subscription",
+            });
+        }
+    }
+);
+
+/*
+ * --------------------------------------------------------------------------
+ * Verify Razorpay Subscription Authorisation
+ * --------------------------------------------------------------------------
+ * Razorpay Checkout returns:
+ *   razorpay_payment_id
+ *   razorpay_subscription_id
+ *   razorpay_signature
+ *
+ * Signature = HMAC-SHA256(payment_id|subscription_id, API secret)
+ */
+
+app.post(
+    "/verify-subscription",
     requireFirebaseUser,
     async (req, res) => {
         try {
             const {
                 razorpay_payment_id,
-                razorpay_order_id,
+                razorpay_subscription_id,
+                razorpay_signature,
             } = req.body || {};
 
             if (
                 !razorpay_payment_id ||
-                !razorpay_order_id
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Payment data missing",
-                });
-            }
-
-            // Android's Razorpay callback in the Zenzy SDK flow does not
-            // provide a payment signature. Verification is performed
-            // server-side by fetching the Razorpay order/payment and
-            // validating the authenticated Firebase user, product and amount.
-            const order =
-                await razorpay.orders.fetch(
-                    razorpay_order_id
-                );
-
-            const uid = order.notes?.uid;
-            const productId = order.notes?.productId;
-
-            if (
-                !uid ||
-                !productId ||
-                uid !== req.uid
-            ) {
-                return res.status(403).json({
-                    success: false,
-                    message:
-                        "Payment order does not belong to this account",
-                });
-            }
-
-            const product = getProduct(productId);
-
-            if (!product) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid payment product",
-                });
-            }
-
-            const expectedAmount =
-                rupeesToPaise(
-                    product.amountRupees
-                );
-
-            if (
-                Number(order.amount) !==
-                expectedAmount
+                !razorpay_subscription_id ||
+                !razorpay_signature
             ) {
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Payment order amount mismatch",
+                        "Subscription payment data missing",
                 });
             }
+
+            const generatedSignature =
+                crypto
+                    .createHmac(
+                        "sha256",
+                        process.env.RAZORPAY_KEY_SECRET
+                    )
+                    .update(
+                        `${razorpay_payment_id}|${razorpay_subscription_id}`
+                    )
+                    .digest("hex");
+
+            if (
+                !safeEqualHex(
+                    generatedSignature,
+                    razorpay_signature
+                )
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid subscription payment signature",
+                });
+            }
+
+            const subscription =
+                await razorpay.subscriptions.fetch(
+                    razorpay_subscription_id
+                );
 
             const payment =
                 await razorpay.payments.fetch(
                     razorpay_payment_id
                 );
 
-            if (
-                Number(payment.amount) !==
-                expectedAmount
-            ) {
-                return res.status(400).json({
+            const uid =
+                subscription.notes?.uid || null;
+            const productId =
+                subscription.notes?.productId || null;
+
+            if (!uid || uid !== req.uid) {
+                return res.status(403).json({
                     success: false,
                     message:
-                        "Payment amount mismatch",
+                        "Subscription does not belong to this account",
                 });
             }
 
+            const product = getProduct(productId);
+
+            if (!product || product.type !== "premium") {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid Premium subscription product",
+                });
+            }
+
+            const expectedInitialAmount =
+                rupeesToPaise(
+                    product.amountRupees
+                );
+
             if (
-                payment.order_id !==
-                razorpay_order_id
+                Number(payment.amount) !==
+                expectedInitialAmount
             ) {
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Payment order mismatch",
+                        "Initial subscription amount mismatch",
                 });
             }
 
@@ -448,36 +1012,28 @@ app.post(
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Payment not completed",
+                        "Initial subscription payment is not completed",
                 });
             }
 
-            const userRef =
-                db.collection("users").doc(uid);
+            const userRef = db
+                .collection("users")
+                .doc(uid);
+            const paymentRef = db
+                .collection("payments")
+                .doc(razorpay_payment_id);
+            const subscriptionRef = db
+                .collection("subscriptions")
+                .doc(razorpay_subscription_id);
 
-            const paymentRef =
-                db.collection("payments")
-                    .doc(razorpay_payment_id);
-
-            const now = new Date();
-
-            const activatedAt =
-                Timestamp.fromDate(now);
-
-            const nextChargeDate =
-                new Date(now);
-
-            if (product.trialDays) {
-                nextChargeDate.setDate(
-                    nextChargeDate.getDate() +
-                    product.trialDays
-                );
-            } else if (product.renewalMonths) {
-                nextChargeDate.setMonth(
-                    nextChargeDate.getMonth() +
-                    product.renewalMonths
-                );
-            }
+            const startAt =
+                subscription.start_at
+                    ? Timestamp.fromMillis(
+                        Number(
+                            subscription.start_at
+                        ) * 1000
+                    )
+                    : null;
 
             await db.runTransaction(
                 async (transaction) => {
@@ -485,545 +1041,3 @@ app.post(
                         await transaction.get(
                             paymentRef
                         );
-
-                    if (existingPayment.exists) {
-                        throw new Error(
-                            "PAYMENT_ALREADY_PROCESSED"
-                        );
-                    }
-
-                    const userSnapshot =
-                        await transaction.get(
-                            userRef
-                        );
-
-                    if (!userSnapshot.exists) {
-                        throw new Error(
-                            "USER_NOT_FOUND"
-                        );
-                    }
-
-                    const userData =
-                        userSnapshot.data() || {};
-
-                    const currentCoins =
-                        Math.max(
-                            0,
-                            Number(
-                                userData.aCoins || 0
-                            )
-                        );
-
-                    const paymentRecord = {
-                        uid,
-                        productId,
-                        productType:
-                            product.type,
-                        productName:
-                            product.name,
-                        amountRupees:
-                            product.amountRupees,
-                        amountPaise:
-                            expectedAmount,
-                        aCoinReward:
-                            product.aCoinReward,
-
-                        razorpayPaymentId:
-                            razorpay_payment_id,
-
-                        razorpayOrderId:
-                            razorpay_order_id,
-
-                        paymentStatus:
-                            payment.status,
-
-                        processedAt:
-                            FieldValue.serverTimestamp(),
-                    };
-
-                    const userUpdate = {
-                        aCoins:
-                            currentCoins +
-                            product.aCoinReward,
-
-                        updatedAt:
-                            FieldValue.serverTimestamp(),
-                    };
-
-                    if (
-                        product.type ===
-                        "premium"
-                    ) {
-                        const activePlans =
-                            Array.isArray(
-                                userData.activePlans
-                            )
-                                ? userData.activePlans
-                                : [];
-
-                        const newPlan = {
-                            id:
-                                `${productId}_${razorpay_payment_id}`,
-
-                            planId:
-                                productId,
-
-                            planName:
-                                product.name,
-
-                            activatedAt,
-
-                            initialAmountPaid:
-                                product.amountRupees,
-
-                            aCoinReward:
-                                product.aCoinReward,
-
-                            nextChargeAmount:
-                                product.renewalAmountRupees,
-
-                            nextChargeDate:
-                                Timestamp.fromDate(
-                                    nextChargeDate
-                                ),
-
-                            renewalAmount:
-                                product.renewalAmountRupees,
-
-                            renewalMonths:
-                                product.renewalMonths ||
-                                null,
-
-                            trialDays:
-                                product.trialDays ||
-                                null,
-
-                            status: "active",
-
-                            razorpayPaymentId:
-                                razorpay_payment_id,
-
-                            razorpayOrderId:
-                                razorpay_order_id,
-                        };
-
-                        userUpdate.plan =
-                            productId ===
-                            "monthly"
-                                ? "MONTHLY"
-                                : "YEARLY";
-
-                        userUpdate.activePlans =
-                            [
-                                ...activePlans,
-                                newPlan,
-                            ];
-
-                        paymentRecord.planId =
-                            productId;
-                    }
-
-                    transaction.set(
-                        userRef,
-                        userUpdate,
-                        {
-                            merge: true,
-                        }
-                    );
-
-                    transaction.set(
-                        paymentRef,
-                        paymentRecord
-                    );
-
-                    const notificationRef =
-                        userRef
-                            .collection(
-                                "notifications"
-                            )
-                            .doc();
-
-                    transaction.set(
-                        notificationRef,
-                        {
-                            title:
-                                product.type ===
-                                "premium"
-                                    ? "Premium Activated"
-                                    : "A-Coin Purchase Successful",
-
-                            message:
-                                `${product.name}: ` +
-                                `${product.aCoinReward} A-Coin ` +
-                                `added to your balance.`,
-
-                            type:
-                                product.type ===
-                                "premium"
-                                    ? "premium"
-                                    : "a_coin_purchase",
-
-                            read: false,
-
-                            createdAt:
-                                FieldValue.serverTimestamp(),
-
-                            razorpayPaymentId:
-                                razorpay_payment_id,
-                        }
-                    );
-                }
-            );
-
-            return res.json({
-                success: true,
-
-                message:
-                    product.type === "premium"
-                        ? "Payment verified and Premium activated"
-                        : "Payment verified and A-Coin added",
-
-                productId,
-
-                productType:
-                    product.type,
-
-                aCoinReward:
-                    product.aCoinReward,
-            });
-        } catch (error) {
-            console.error(
-                "VERIFY PAYMENT ERROR:",
-                error
-            );
-
-            if (
-                error.message ===
-                "PAYMENT_ALREADY_PROCESSED"
-            ) {
-                return res.status(409).json({
-                    success: false,
-                    message:
-                        "This payment was already processed",
-                });
-            }
-
-            if (
-                error.message ===
-                "USER_NOT_FOUND"
-            ) {
-                return res.status(404).json({
-                    success: false,
-                    message:
-                        "Zenzy user account not found",
-                });
-            }
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Payment verification failed",
-            });
-        }
-    }
-);
-
-/*
- * --------------------------------------------------------------------------
- * Secure Video Request + A-Coin deduction
- * --------------------------------------------------------------------------
- *
- * This endpoint is included so the Android app no longer needs permission
- * to modify aCoins itself.
- *
- * The server checks the balance and creates the request atomically with
- * the deduction.
- *
- * Cloudinary upload can still happen from Android using the existing
- * unsigned upload preset. Only the final photo URLs and request metadata
- * are sent here.
- */
-
-const VIDEO_COSTS = {
-    10: 18,
-    30: 50,
-    50: 76,
-    90: 250,
-};
-
-app.post(
-    "/create-video-request",
-    requireFirebaseUser,
-    async (req, res) => {
-        try {
-            const body = req.body || {};
-
-            const {
-                name,
-                description,
-                plan,
-                photoUrl,
-                photoUrls,
-                photoCount,
-                photoSelected,
-                videoDurationSeconds,
-                aCoinCost,
-                quality,
-                createdAt,
-                requestDate,
-            } = body;
-
-            const duration =
-                Number(videoDurationSeconds);
-
-            const expectedCost =
-                VIDEO_COSTS[duration];
-
-            if (
-                !expectedCost ||
-                Number(aCoinCost) !==
-                    expectedCost
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Invalid video duration or A-Coin cost",
-                });
-            }
-
-            const urls =
-                Array.isArray(photoUrls)
-                    ? photoUrls.filter(
-                        (url) =>
-                            typeof url ===
-                                "string" &&
-                            url.trim()
-                    )
-                    : [];
-
-            if (
-                urls.length < 1 ||
-                urls.length > 5
-            ) {
-                return res.status(400).json({
-                    success: false,
-                    message:
-                        "Please provide 1 to 5 uploaded photos",
-                });
-            }
-
-            const userRef =
-                db.collection("users")
-                    .doc(req.uid);
-
-            const requestRef =
-                db.collection(
-                    "videoRequests"
-                ).doc();
-
-            let remainingCoins = 0;
-
-            await db.runTransaction(
-                async (transaction) => {
-                    const userSnapshot =
-                        await transaction.get(
-                            userRef
-                        );
-
-                    if (
-                        !userSnapshot.exists
-                    ) {
-                        throw new Error(
-                            "USER_NOT_FOUND"
-                        );
-                    }
-
-                    const userData =
-                        userSnapshot.data() ||
-                        {};
-
-                    const currentCoins =
-                        Math.max(
-                            0,
-                            Number(
-                                userData.aCoins ||
-                                    0
-                            )
-                        );
-
-                    if (
-                        currentCoins <
-                        expectedCost
-                    ) {
-                        throw new Error(
-                            "INSUFFICIENT_A_COINS"
-                        );
-                    }
-
-                    remainingCoins =
-                        currentCoins -
-                        expectedCost;
-
-                    transaction.set(
-                        userRef,
-                        {
-                            aCoins:
-                                remainingCoins,
-
-                            updatedAt:
-                                FieldValue.serverTimestamp(),
-                        },
-                        {
-                            merge: true,
-                        }
-                    );
-
-                    transaction.set(
-                        requestRef,
-                        {
-                            uid: req.uid,
-
-                            name:
-                                typeof name ===
-                                "string"
-                                    ? name
-                                    : "",
-
-                            mobile: req.uid,
-
-                            description:
-                                typeof description ===
-                                "string"
-                                    ? description.trim()
-                                    : "",
-
-                            plan:
-                                typeof plan ===
-                                "string"
-                                    ? plan
-                                    : "FREE",
-
-                            photoUrl:
-                                typeof photoUrl ===
-                                "string"
-                                    ? photoUrl
-                                    : urls[0],
-
-                            photoUrls: urls,
-
-                            photoCount:
-                                Number(
-                                    photoCount
-                                ) ||
-                                urls.length,
-
-                            photoSelected:
-                                photoSelected !==
-                                false,
-
-                            status: "Pending",
-
-                            createdAt:
-                                typeof createdAt ===
-                                "string"
-                                    ? createdAt
-                                    : new Date()
-                                        .toISOString(),
-
-                            requestDate:
-                                typeof requestDate ===
-                                "string"
-                                    ? requestDate
-                                    : new Date()
-                                        .toISOString()
-                                        .slice(
-                                            0,
-                                            10
-                                        ),
-
-                            videoDurationSeconds:
-                                duration,
-
-                            aCoinCost:
-                                expectedCost,
-
-                            quality:
-                                typeof quality ===
-                                "string"
-                                    ? quality
-                                    : (
-                                        duration ===
-                                        90
-                                            ? "Ultra Full HD"
-                                            : "Full HD"
-                                    ),
-
-                            submittedAt:
-                                FieldValue.serverTimestamp(),
-                        }
-                    );
-                }
-            );
-
-            return res.json({
-                success: true,
-
-                requestId:
-                    requestRef.id,
-
-                remainingCoins,
-
-                aCoinCost:
-                    expectedCost,
-            });
-        } catch (error) {
-            console.error(
-                "CREATE VIDEO REQUEST ERROR:",
-                error
-            );
-
-            if (
-                error.message ===
-                "USER_NOT_FOUND"
-            ) {
-                return res.status(404).json({
-                    success: false,
-                    message:
-                        "Zenzy user account not found",
-                });
-            }
-
-            if (
-                error.message ===
-                "INSUFFICIENT_A_COINS"
-            ) {
-                return res.status(409).json({
-                    success: false,
-                    message:
-                        "Insufficient A-Coin balance",
-                });
-            }
-
-            return res.status(500).json({
-                success: false,
-                message:
-                    "Video request could not be created",
-            });
-        }
-    }
-);
-
-/*
- * --------------------------------------------------------------------------
- * Start Server
- * --------------------------------------------------------------------------
- */
-
-const PORT =
-    process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log(
-        `Zenzy Payment Backend running on port ${PORT}`
-    );
-});
