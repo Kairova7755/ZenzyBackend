@@ -37,25 +37,39 @@ app.use(express.json({ limit: "2mb" }));
 function getFirebaseCredential() {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
 
-    if (raw) {
-        try {
-            return cert(JSON.parse(raw));
-        } catch (error) {
-            console.error(
-                "FIREBASE_SERVICE_ACCOUNT JSON ERROR:",
-                error.message
-            );
-            throw new Error(
-                "Invalid FIREBASE_SERVICE_ACCOUNT environment variable"
-            );
-        }
+    if (!raw) {
+        throw new Error(
+            "FIREBASE_SERVICE_ACCOUNT is missing in Render Environment Variables"
+        );
     }
 
-    return applicationDefault();
+    try {
+        const serviceAccount = JSON.parse(raw);
+
+        if (!serviceAccount.project_id) {
+            throw new Error(
+                "project_id is missing inside FIREBASE_SERVICE_ACCOUNT"
+            );
+        }
+
+        return {
+            credential: cert(serviceAccount),
+            projectId: serviceAccount.project_id,
+        };
+    } catch (error) {
+        console.error(
+            "FIREBASE CONFIG ERROR:",
+            error.message
+        );
+
+        throw error;
+    }
 }
 
-initializeApp({
-    credential: getFirebaseCredential(),
+const firebaseConfig = getFirebaseCredential();
+
+initializeApp(firebaseConfig);
+
 });
 
 const db = getFirestore();
