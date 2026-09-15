@@ -70,8 +70,6 @@ const firebaseConfig = getFirebaseCredential();
 
 initializeApp(firebaseConfig);
 
-});
-
 const db = getFirestore();
 const adminAuth = getAuth();
 
