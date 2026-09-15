@@ -559,6 +559,98 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
 
 /*
  * --------------------------------------------------------------------------
+ * Cancel Subscription Endpoint
+ * --------------------------------------------------------------------------
+ */
+
+app.post("/cancel-subscription", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+        const userRef = db.collection("users").doc(uid);
+        const userDoc = await userRef.get();
+
+        if (!userDoc.exists) {
+            return res.status(404).json({
+                success: false,
+                message: "User profile not found",
+            });
+        }
+
+        const userData = userDoc.data() || {};
+        let subscriptionId =
+            userData.razorpaySubscriptionId ||
+            userData.subscriptionId ||
+            null;
+
+        if (!subscriptionId) {
+            const subQuery = await db
+                .collection("subscriptions")
+                .where("uid", "==", uid)
+                .where("status", "==", "active")
+                .limit(1)
+                .get();
+
+            if (!subQuery.empty) {
+                subscriptionId = subQuery.docs[0].id;
+            }
+        }
+
+        if (!subscriptionId) {
+            return res.status(400).json({
+                success: false,
+                message: "No active Razorpay subscription ID found for this account",
+            });
+        }
+
+        // Cancel subscription at the end of current cycle
+        const cancelledSubscription = await razorpay.subscriptions.cancel(
+            subscriptionId,
+            true
+        );
+
+        const now = FieldValue.serverTimestamp();
+
+        await userRef.set(
+            {
+                autoRenew: false,
+                cancelAtCycleEnd: true,
+                subscriptionStatus: "cancelled_at_cycle_end",
+                updatedAt: now,
+            },
+            { merge: true }
+        );
+
+        const subscriptionRef = db.collection("subscriptions").doc(subscriptionId);
+        const subDoc = await subscriptionRef.get();
+        if (subDoc.exists) {
+            await subscriptionRef.set(
+                {
+                    status: "cancelled",
+                    cancelAtCycleEnd: true,
+                    updatedAt: now,
+                },
+                { merge: true }
+            );
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: "Subscription set to cancel at the end of current billing cycle",
+            subscriptionId: subscriptionId,
+            status: cancelledSubscription.status,
+        });
+
+    } catch (error) {
+        console.error("Cancel Subscription Error:", error);
+        return res.status(500).json({
+            success: false,
+            message: error.message || "Failed to cancel subscription",
+        });
+    }
+});
+
+/*
+ * --------------------------------------------------------------------------
  * Subscription Webhook Endpoint
  * --------------------------------------------------------------------------
  */
@@ -807,5 +899,5 @@ app.post(
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`Server running on port {PORT}`);
+    console.log(`Server running on port ${PORT}`);
 });
