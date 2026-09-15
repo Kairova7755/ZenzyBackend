@@ -110,8 +110,8 @@ const PRODUCTS = {
         trialDays: 30, // 1 month
         description: "Yearly Zenzy Subscription",
     },
-    coin_30: {
-        id: "coin_30",
+    coin_49: {
+        id: "coin_49",
         type: "pack",
         name: "Starter A-Coin",
         amountInPaise: 4900, // ₹49
@@ -119,8 +119,8 @@ const PRODUCTS = {
         aCoinReward: 30,
         description: "30 A-Coins Pack",
     },
-    coin_80: {
-        id: "coin_80",
+    coin_99: {
+        id: "coin_99",
         type: "pack",
         name: "Boost A-Coin",
         amountInPaise: 9900, // ₹99
@@ -128,17 +128,17 @@ const PRODUCTS = {
         aCoinReward: 80,
         description: "80 A-Coins Pack",
     },
-    coin_200: {
-        id: "coin_200",
+    coin_199: {
+        id: "coin_199",
         type: "pack",
         name: "Popular A-Coin",
-        amountInPaise: 19900, // ₹199
+        amountInPaise: 21000, // ₹210
         amountRupees: 210,
         aCoinReward: 200,
         description: "200 A-Coins Pack",
     },
     coin_499: {
-        id: "coin_550",
+        id: "coin_499",
         type: "pack",
         name: "Pro A-Coin",
         amountInPaise: 49900, // ₹499
@@ -807,5 +807,5 @@ app.post(
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Server running on port {PORT}`);
 });
