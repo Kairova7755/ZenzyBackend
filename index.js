@@ -92,7 +92,7 @@ const PRODUCTS = {
         name: "Monthly Premium",
         amountInPaise: 100, // ₹1 initial payment
         amountRupees: 1,
-        aCoinReward: 210,
+        aCoinReward: 650,
         renewalAmountRupees: 499,
         renewalPrice: 499,
         trialDays: 3,
@@ -104,41 +104,41 @@ const PRODUCTS = {
         name: "Yearly Premium",
         amountInPaise: 100, // ₹1 initial payment
         amountRupees: 1,
-        aCoinReward: 1049,
+        aCoinReward: 2800,
         renewalAmountRupees: 2100,
         renewalPrice: 2100,
         trialDays: 30, // 1 month
         description: "Yearly Zenzy Subscription",
     },
-    coin_49: {
-        id: "coin_49",
+    coin_30: {
+        id: "coin_30",
         type: "pack",
         name: "Starter A-Coin",
         amountInPaise: 4900, // ₹49
         amountRupees: 49,
-        aCoinReward: 40,
-        description: "40 A-Coins Pack",
+        aCoinReward: 30,
+        description: "30 A-Coins Pack",
     },
-    coin_99: {
-        id: "coin_99",
+    coin_80: {
+        id: "coin_80",
         type: "pack",
         name: "Boost A-Coin",
         amountInPaise: 9900, // ₹99
         amountRupees: 99,
-        aCoinReward: 90,
-        description: "90 A-Coins Pack",
+        aCoinReward: 80,
+        description: "80 A-Coins Pack",
     },
-    coin_199: {
-        id: "coin_199",
+    coin_200: {
+        id: "coin_200",
         type: "pack",
         name: "Popular A-Coin",
         amountInPaise: 19900, // ₹199
-        amountRupees: 199,
+        amountRupees: 210,
         aCoinReward: 200,
         description: "200 A-Coins Pack",
     },
     coin_499: {
-        id: "coin_499",
+        id: "coin_550",
         type: "pack",
         name: "Pro A-Coin",
         amountInPaise: 49900, // ₹499
