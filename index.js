@@ -306,71 +306,159 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
 
 app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
     try {
-        const { razorpay_payment_id, razorpay_order_id, productId } = req.body || {};
+        const {
+            razorpay_payment_id,
+            razorpay_order_id,
+            razorpay_signature,
+        } = req.body || {};
+
         const uid = req.uid;
 
-        if (!razorpay_payment_id || !razorpay_order_id || !productId) {
-            return res.status(400).json({ error: "Missing required parameters" });
+        if (
+            !razorpay_payment_id ||
+            !razorpay_order_id ||
+            !razorpay_signature
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Missing payment verification parameters",
+            });
+        }
+
+        // Fetch the order from Razorpay first.
+        const order = await razorpay.orders.fetch(razorpay_order_id);
+
+        if (!order) {
+            return res.status(404).json({
+                success: false,
+                message: "Razorpay order not found",
+            });
+        }
+
+        // Get productId from the SERVER-SIDE Razorpay order notes.
+        const orderUid = order.notes?.uid;
+        const productId = order.notes?.productId;
+
+        if (!orderUid || !productId) {
+            return res.status(400).json({
+                success: false,
+                message: "Payment order context is missing",
+            });
+        }
+
+        // Make sure this order belongs to the logged-in Firebase user.
+        if (orderUid !== uid) {
+            return res.status(403).json({
+                success: false,
+                message: "Payment order does not belong to this account",
+            });
         }
 
         const product = getProduct(productId);
+
         if (!product) {
-            return res.status(400).json({ error: "Invalid product" });
+            return res.status(400).json({
+                success: false,
+                message: "Invalid payment product",
+            });
         }
 
-        const payment = await razorpay.payments.fetch(razorpay_payment_id);
-        const order = await razorpay.orders.fetch(razorpay_order_id);
+        // Verify Razorpay checkout signature.
+        const expectedSignature = crypto
+            .createHmac(
+                "sha256",
+                process.env.RAZORPAY_KEY_SECRET
+            )
+            .update(`${order.id}|${razorpay_payment_id}`)
+            .digest("hex");
 
-        if (!payment || !order) {
-            return res
-                .status(404)
-                .json({ error: "Payment or Order verification failed" });
+        if (!safeEqualHex(expectedSignature, razorpay_signature)) {
+            console.error("RAZORPAY PAYMENT SIGNATURE MISMATCH");
+
+            return res.status(400).json({
+                success: false,
+                message: "Payment signature verification failed",
+            });
         }
 
-        if (payment.order_id !== razorpay_order_id) {
-            return res
-                .status(400)
-                .json({ error: "Payment and Order mismatch" });
+        // Fetch payment from Razorpay.
+        const payment =
+            await razorpay.payments.fetch(razorpay_payment_id);
+
+        if (!payment) {
+            return res.status(404).json({
+                success: false,
+                message: "Razorpay payment not found",
+            });
         }
 
+        // Payment must belong to this order.
+        if (payment.order_id !== order.id) {
+            return res.status(400).json({
+                success: false,
+                message: "Payment and order mismatch",
+            });
+        }
+
+        // Payment must be completed.
         if (
             payment.status !== "captured" &&
             payment.status !== "authorized"
         ) {
-            return res
-                .status(400)
-                .json({ error: "Payment status is not authorized or captured" });
+            return res.status(400).json({
+                success: false,
+                message: "Payment not completed",
+            });
         }
 
+        // Verify amount from the server-side product.
         if (
-            !order.notes ||
-            order.notes.uid !== uid ||
-            order.notes.productId !== productId
+            Number(order.amount) !== Number(product.amountInPaise) ||
+            Number(payment.amount) !== Number(product.amountInPaise)
         ) {
-            return res
-                .status(403)
-                .json({ error: "Order context verification failed" });
+            return res.status(400).json({
+                success: false,
+                message: "Payment amount mismatch",
+            });
         }
 
-        if (
-            order.amount !== product.amountInPaise ||
-            payment.amount !== product.amountInPaise
-        ) {
-            return res.status(400).json({ error: "Amount mismatch detected" });
-        }
+        const paymentRef = db
+            .collection("payments")
+            .doc(razorpay_payment_id);
 
-        const paymentRef = db.collection("payments").doc(razorpay_payment_id);
-        const userRef = db.collection("users").doc(uid);
+        const userRef = db
+            .collection("users")
+            .doc(uid);
 
         await db.runTransaction(async (transaction) => {
-            const paymentDoc = await transaction.get(paymentRef);
+            const paymentDoc =
+                await transaction.get(paymentRef);
+
             if (paymentDoc.exists) {
-                return;
+                throw new Error("PAYMENT_ALREADY_PROCESSED");
             }
+
+            const userDoc =
+                await transaction.get(userRef);
+
+            if (!userDoc.exists) {
+                throw new Error("USER_NOT_FOUND");
+            }
+
+            const userData = userDoc.data() || {};
+
+            const currentCoins = Math.max(
+                0,
+                Number(userData.aCoins || userData.acoin || 0)
+            );
+
+            const isSubscription =
+                product.type === "subscription" ||
+                product.type === "premium";
 
             transaction.set(paymentRef, {
                 paymentId: razorpay_payment_id,
-                orderId: razorpay_order_id,
+                orderId: order.id,
                 uid: uid,
                 productId: productId,
                 amount: payment.amount,
@@ -378,37 +466,36 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
                 createdAt: FieldValue.serverTimestamp(),
             });
 
-            const userDoc = await transaction.get(userRef);
-            const isSubscription = product.type === "subscription" || product.type === "premium";
+            const updateData = {
+                aCoins:
+                    currentCoins + product.aCoinReward,
 
-            let updateData = {
-                aCoins: FieldValue.increment(product.aCoinReward),
-                acoin: FieldValue.increment(product.aCoinReward),
-                updatedAt: FieldValue.serverTimestamp(),
+                acoin:
+                    currentCoins + product.aCoinReward,
+
+                updatedAt:
+                    FieldValue.serverTimestamp(),
             };
 
             if (isSubscription) {
                 updateData.isPremium = true;
-                updateData.plan = productId === "monthly" ? "MONTHLY" : "YEARLY";
-                updateData.subscriptionType = productId;
-                updateData.subscriptionStartDate = FieldValue.serverTimestamp();
+
+                updateData.plan =
+                    productId === "monthly"
+                        ? "MONTHLY"
+                        : "YEARLY";
+
+                updateData.subscriptionType =
+                    productId;
+
+                updateData.subscriptionStartDate =
+                    FieldValue.serverTimestamp();
             }
 
-            if (!userDoc.exists) {
-                transaction.set(userRef, {
-                    uid: uid,
-                    mobile: uid,
-                    aCoins: product.aCoinReward,
-                    acoin: product.aCoinReward,
-                    isPremium: isSubscription,
-                    plan: isSubscription ? (productId === "monthly" ? "MONTHLY" : "YEARLY") : "FREE",
-                    subscriptionType: isSubscription ? productId : null,
-                    createdAt: FieldValue.serverTimestamp(),
-                    updatedAt: FieldValue.serverTimestamp(),
-                });
-            } else {
-                transaction.update(userRef, updateData);
-            }
+            transaction.update(
+                userRef,
+                updateData
+            );
 
             const notificationRef = db
                 .collection("users")
@@ -416,13 +503,22 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
                 .collection("notifications")
                 .doc();
 
-            transaction.set(notificationRef, {
-                title: "Payment Successful",
-                message: `You received ${product.aCoinReward} A-Coins for purchasing ${product.name || product.description}.`,
-                type: "payment",
-                createdAt: FieldValue.serverTimestamp(),
-                read: false,
-            });
+            transaction.set(
+                notificationRef,
+                {
+                    title: "Payment Successful",
+
+                    message:
+                        `You received ${product.aCoinReward} A-Coins for purchasing ${product.name || product.description}.`,
+
+                    type: "payment",
+
+                    createdAt:
+                        FieldValue.serverTimestamp(),
+
+                    read: false,
+                }
+            );
         });
 
         return res.status(200).json({
@@ -432,107 +528,32 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
             aCoinReward: product.aCoinReward,
             aCoinAwarded: product.aCoinReward,
         });
+
     } catch (error) {
-        console.error("Verify Payment Error:", error);
-        return res
-            .status(500)
-            .json({ error: "Failed to process and verify payment" });
-    }
-});
 
-app.post("/create-video-request", requireFirebaseUser, async (req, res) => {
-    try {
-        const { duration, photos, photoUrls, prompt, description } = req.body || {};
-        const uid = req.uid;
+        console.error(
+            "Verify Payment Error:",
+            error
+        );
 
-        const selectedDuration = duration || req.body.videoDurationSeconds;
-        const inputPhotos = photos || photoUrls || [];
-
-        if (!selectedDuration || !VIDEO_COSTS[selectedDuration]) {
-            return res.status(400).json({ error: "Invalid video duration selected" });
+        if (error.message === "PAYMENT_ALREADY_PROCESSED") {
+            return res.status(409).json({
+                success: false,
+                message: "Payment has already been processed",
+            });
         }
 
-        if (
-            !inputPhotos ||
-            !Array.isArray(inputPhotos) ||
-            inputPhotos.length < 1 ||
-            inputPhotos.length > 5
-        ) {
-            return res
-                .status(400)
-                .json({ error: "Requires between 1 and 5 photo URLs" });
-        }
-
-        const requiredCoins = VIDEO_COSTS[selectedDuration];
-        const userRef = db.collection("users").doc(uid);
-        const videoRequestRef = db.collection("video_requests").doc();
-
-        let createdRequestId;
-        let remainingCoins = 0;
-
-        await db.runTransaction(async (transaction) => {
-            const userDoc = await transaction.get(userRef);
-
-            if (!userDoc.exists) {
-                throw new Error("USER_NOT_FOUND");
-            }
-
-            const userData = userDoc.data();
-            const currentCoins = Number(userData.aCoins || userData.acoin || 0);
-
-            if (currentCoins < requiredCoins) {
-                throw new Error("INSUFFICIENT_FUNDS");
-            }
-
-            remainingCoins = currentCoins - requiredCoins;
-
-            transaction.update(userRef, {
-                aCoins: FieldValue.increment(-requiredCoins),
-                acoin: FieldValue.increment(-requiredCoins),
-                updatedAt: FieldValue.serverTimestamp(),
-            });
-
-            createdRequestId = videoRequestRef.id;
-
-            transaction.set(videoRequestRef, {
-                id: createdRequestId,
-                uid: uid,
-                mobile: uid,
-                duration: Number(selectedDuration),
-                videoDurationSeconds: Number(selectedDuration),
-                photos: inputPhotos,
-                photoUrls: inputPhotos,
-                photoUrl: inputPhotos[0] || "",
-                prompt: prompt || description || "",
-                description: description || prompt || "",
-                cost: requiredCoins,
-                aCoinCost: requiredCoins,
-                status: "Pending",
-                createdAt: FieldValue.serverTimestamp(),
-                updatedAt: FieldValue.serverTimestamp(),
-            });
-        });
-
-        return res.status(200).json({
-            success: true,
-            requestId: createdRequestId,
-            deductedCoins: requiredCoins,
-            remainingCoins: remainingCoins,
-            message: "Video generation request submitted successfully",
-        });
-    } catch (error) {
-        console.error("Create Video Request Error:", error);
         if (error.message === "USER_NOT_FOUND") {
-            return res.status(404).json({ error: "User profile not found" });
+            return res.status(404).json({
+                success: false,
+                message: "User profile not found",
+            });
         }
-        if (error.message === "INSUFFICIENT_FUNDS") {
-            return res
-                .status(400)
-                .json({ error: "Insufficient A-Coins balance" });
-        }
-        return res
-            .status(500)
-            .json({ error: "Failed to create video request" });
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to process and verify payment",
+        });
     }
 });
 
