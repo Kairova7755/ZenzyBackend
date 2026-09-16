@@ -270,35 +270,6 @@ app.post("/create-order", requireFirebaseUser, async (req, res) => {
         const { productId } = req.body || {};
 const uid = req.uid;
 
-// Prevent purchasing the SAME Premium plan again while
-// an existing subscription for that plan is still active.
-if (productId === "monthly" || productId === "yearly") {
-    const existingSubscriptions = await db
-        .collection("subscriptions")
-        .where("uid", "==", uid)
-        .where("productId", "==", productId)
-        .get();
-
-    const hasActiveSamePlan = existingSubscriptions.docs.some((doc) => {
-        const data = doc.data() || {};
-        const status = String(data.status || "").toLowerCase();
-
-        return (
-            ["active", "authenticated", "pending"].includes(status) ||
-            data.cancelAtCycleEnd === true
-        );
-    });
-
-    if (hasActiveSamePlan) {
-        return res.status(409).json({
-            success: false,
-            error: "This Premium plan is already purchased. Cancel the existing plan before purchasing it again.",
-            code: "PLAN_ALREADY_PURCHASED",
-            productId,
-        });
-    }
-}
-
 const product = getProduct(productId);
 
         if (!productId || !product) {
@@ -353,10 +324,38 @@ const product = getProduct(productId);
 app.post("/create-subscription", requireFirebaseUser, async (req, res) => {
     try {
         const { productId } = req.body || {};
-        const uid = req.uid;
+const uid = req.uid;
 
-        const product = getProduct(productId);
+// Prevent purchasing the SAME Premium plan again while
+// an existing subscription for that plan is still active.
+if (productId === "monthly" || productId === "yearly") {
+    const existingSubscriptions = await db
+        .collection("subscriptions")
+        .where("uid", "==", uid)
+        .where("productId", "==", productId)
+        .get();
 
+    const hasActiveSamePlan = existingSubscriptions.docs.some((doc) => {
+        const data = doc.data() || {};
+        const status = String(data.status || "").toLowerCase();
+
+        return (
+            ["active", "authenticated", "pending"].includes(status) ||
+            data.cancelAtCycleEnd === true
+        );
+    });
+
+    if (hasActiveSamePlan) {
+        return res.status(409).json({
+            success: false,
+            error: "This Premium plan is already purchased. Cancel the existing plan before purchasing it again.",
+            code: "PLAN_ALREADY_PURCHASED",
+            productId,
+        });
+    }
+}
+
+const product = getProduct(productId);
         // Only Premium subscription products are allowed here.
         if (!productId || !product || product.type !== "subscription") {
             return res.status(400).json({
