@@ -1431,9 +1431,263 @@ app.post(
  * App Listener
  * --------------------------------------------------------------------------
  */
+/*
+ * --------------------------------------------------------------------------
+ * Secure Video Request + A-Coin Deduction
+ * POST /create-video-request
+ * --------------------------------------------------------------------------
+ */
+
+app.post(
+    "/create-video-request",
+    requireFirebaseUser,
+    async (req, res) => {
+        try {
+            const body = req.body || {};
+
+            const {
+                name,
+                mobile,
+                description,
+                plan,
+                photoUrl,
+                photoUrls,
+                photoCount,
+                photoSelected,
+                videoDurationSeconds,
+                aCoinCost,
+                quality,
+                createdAt,
+                requestDate,
+            } = body;
+
+            const duration = Number(videoDurationSeconds);
+            const expectedCost = VIDEO_COSTS[duration];
+
+            // Validate duration and server-side price
+            if (!expectedCost) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid video duration selected",
+                });
+            }
+
+            if (Number(aCoinCost) !== expectedCost) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid A-Coin cost",
+                });
+            }
+
+            // Validate uploaded photos
+            const urls = Array.isArray(photoUrls)
+                ? photoUrls.filter(
+                      (url) =>
+                          typeof url === "string" &&
+                          url.trim().length > 0
+                  )
+                : [];
+
+            if (urls.length < 1 || urls.length > 5) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Please provide 1 to 5 uploaded photos",
+                });
+            }
+
+            const uid = req.uid;
+
+            const userRef = db
+                .collection("users")
+                .doc(uid);
+
+            const requestRef = db
+                .collection("videoRequests")
+                .doc();
+
+            let remainingCoins = 0;
+
+            // Atomically check balance + deduct A-Coins + create request
+            await db.runTransaction(async (transaction) => {
+
+                const userSnapshot =
+                    await transaction.get(userRef);
+
+                if (!userSnapshot.exists) {
+                    throw new Error("USER_NOT_FOUND");
+                }
+
+                const userData =
+                    userSnapshot.data() || {};
+
+                const currentCoins = Math.max(
+                    0,
+                    Number(
+                        userData.aCoins ||
+                        userData.acoin ||
+                        0
+                    )
+                );
+
+                if (currentCoins < expectedCost) {
+                    throw new Error(
+                        "INSUFFICIENT_A_COINS"
+                    );
+                }
+
+                remainingCoins =
+                    currentCoins - expectedCost;
+
+                // Deduct A-Coins
+                transaction.set(
+                    userRef,
+                    {
+                        aCoins: remainingCoins,
+                        acoin: remainingCoins,
+                        updatedAt:
+                            FieldValue.serverTimestamp(),
+                    },
+                    {
+                        merge: true,
+                    }
+                );
+
+                // Create video request
+                transaction.set(
+                    requestRef,
+                    {
+                        id: requestRef.id,
+                        uid: uid,
+
+                        name:
+                            typeof name === "string"
+                                ? name
+                                : "",
+
+                        mobile:
+                            typeof mobile === "string"
+                                ? mobile
+                                : uid,
+
+                        description:
+                            typeof description === "string"
+                                ? description.trim()
+                                : "",
+
+                        plan:
+                            typeof plan === "string"
+                                ? plan
+                                : "FREE",
+
+                        photoUrl:
+                            typeof photoUrl === "string" &&
+                            photoUrl.trim()
+                                ? photoUrl
+                                : urls[0],
+
+                        photoUrls: urls,
+
+                        photoCount:
+                            Number(photoCount) ||
+                            urls.length,
+
+                        photoSelected:
+                            photoSelected !== false,
+
+                        videoDurationSeconds:
+                            duration,
+
+                        aCoinCost:
+                            expectedCost,
+
+                        quality:
+                            typeof quality === "string"
+                                ? quality
+                                : (
+                                      duration === 90
+                                          ? "Ultra Full HD"
+                                          : "Full HD"
+                                  ),
+
+                        status: "Pending",
+
+                        createdAt:
+                            typeof createdAt === "string"
+                                ? createdAt
+                                : new Date().toISOString(),
+
+                        requestDate:
+                            typeof requestDate === "string"
+                                ? requestDate
+                                : new Date()
+                                      .toISOString()
+                                      .slice(0, 10),
+
+                        submittedAt:
+                            FieldValue.serverTimestamp(),
+
+                        updatedAt:
+                            FieldValue.serverTimestamp(),
+                    }
+                );
+            });
+
+            return res.status(200).json({
+                success: true,
+                message:
+                    "Video generation request submitted successfully",
+
+                requestId:
+                    requestRef.id,
+
+                deductedCoins:
+                    expectedCost,
+
+                remainingCoins:
+                    remainingCoins,
+
+                aCoinCost:
+                    expectedCost,
+            });
+
+        } catch (error) {
+
+            console.error(
+                "CREATE VIDEO REQUEST ERROR:",
+                error
+            );
+
+            if (error.message === "USER_NOT_FOUND") {
+                return res.status(404).json({
+                    success: false,
+                    message:
+                        "Zenzy user account not found",
+                });
+            }
+
+            if (
+                error.message ===
+                "INSUFFICIENT_A_COINS"
+            ) {
+                return res.status(409).json({
+                    success: false,
+                    message:
+                        "Insufficient A-Coin balance",
+                });
+            }
+
+            return res.status(500).json({
+                success: false,
+                message:
+                    "Video request could not be created",
+            });
+        }
+    }
+);
 
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
+
