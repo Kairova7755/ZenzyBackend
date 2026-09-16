@@ -326,28 +326,58 @@ app.post("/create-subscription", requireFirebaseUser, async (req, res) => {
         const { productId } = req.body || {};
 const uid = req.uid;
 
-// Prevent purchasing the SAME Premium plan again while
-// an existing subscription for that plan is still active.
+// Premium is one active subscription per account.
+// Monthly OR Yearly Premium means no second Premium purchase.
 if (productId === "monthly" || productId === "yearly") {
+    const userRef = db.collection("users").doc(uid);
+
+    const userSnapshot = await userRef.get();
+    const userData = userSnapshot.exists
+        ? (userSnapshot.data() || {})
+        : {};
+
+    const userPremiumActive =
+        userData.isPremium === true ||
+        ["MONTHLY", "YEARLY"].includes(
+            String(userData.plan || "").toUpperCase()
+        );
+
     const existingSubscriptions = await db
         .collection("subscriptions")
         .where("uid", "==", uid)
-        .where("productId", "==", productId)
         .get();
 
-    const hasActiveSamePlan = existingSubscriptions.docs.some((doc) => {
-        const data = doc.data() || {};
-        const status = String(data.status || "").toLowerCase();
+    const hasActivePremiumSubscription =
+        existingSubscriptions.docs.some((doc) => {
+            const data = doc.data() || {};
 
-        return ["active", "authenticated", "pending"].includes(status);
-    });
+            const subscriptionProduct =
+                String(data.productId || "").toLowerCase();
 
-    if (hasActiveSamePlan) {
+            const status =
+                String(data.status || "").toLowerCase();
+
+            return (
+                (subscriptionProduct === "monthly" ||
+                    subscriptionProduct === "yearly") &&
+                (
+                    [
+                        "active",
+                        "authenticated",
+                        "pending",
+                        "created",
+                    ].includes(status) ||
+                    data.cancelAtCycleEnd === true
+                )
+            );
+        });
+
+    if (userPremiumActive || hasActivePremiumSubscription) {
         return res.status(409).json({
             success: false,
-            error: "This Premium plan is already purchased. Cancel the existing plan before purchasing it again.",
-            code: "PLAN_ALREADY_PURCHASED",
-            productId,
+            error:
+                "Premium is already active for this account. You cannot purchase another Premium plan.",
+            code: "PREMIUM_ALREADY_ACTIVE",
         });
     }
 }
@@ -609,11 +639,24 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
                     throw new Error("USER_NOT_FOUND");
                 }
 
-                const userData = userDoc.data() || {};
-                const currentCoins = Math.max(
-                    0,
-                    Number(userData.aCoins || userData.acoin || 0)
-                );
+               const userData = userDoc.data() || {};
+
+// Do not activate/reward a second Premium subscription.
+const existingPremiumSubscriptionId =
+    String(userData.razorpaySubscriptionId || "").trim();
+
+if (
+    userData.isPremium === true &&
+    existingPremiumSubscriptionId &&
+    existingPremiumSubscriptionId !== razorpay_subscription_id
+) {
+    throw new Error("PREMIUM_ALREADY_ACTIVE");
+}
+
+const currentCoins = Math.max(
+    0,
+    Number(userData.aCoins || userData.acoin || 0)
+);
 
                 transaction.set(paymentRef, {
                     paymentId: razorpay_payment_id,
@@ -839,6 +882,15 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
                 message: "Payment has already been processed",
             });
         }
+
+        if (error.message === "PREMIUM_ALREADY_ACTIVE") {
+    return res.status(409).json({
+        success: false,
+        message:
+            "Premium is already active for this account. This payment cannot activate another Premium plan.",
+        code: "PREMIUM_ALREADY_ACTIVE",
+    });
+}
 
         if (error.message === "USER_NOT_FOUND") {
             return res.status(404).json({
