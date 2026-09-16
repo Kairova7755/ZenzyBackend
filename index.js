@@ -830,99 +830,188 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
 
 /*
  * --------------------------------------------------------------------------
+ * Get All Premium Subscriptions (GET /my-subscriptions)
+ * --------------------------------------------------------------------------
+ */
+app.get("/my-subscriptions", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+
+        const snapshot = await db
+            .collection("subscriptions")
+            .where("uid", "==", uid)
+            .get();
+
+        const subscriptions = snapshot.docs.map((doc) => {
+            const data = doc.data() || {};
+
+            return {
+                subscriptionId:
+                    data.razorpaySubscriptionId || doc.id,
+                productId: data.productId || "",
+                productName: data.productName || "",
+                status: data.status || "",
+                trialEndsAt: data.trialEndsAt || null,
+                renewalAmountRupees:
+                    data.renewalAmountRupees || null,
+                cancelAtCycleEnd:
+                    data.cancelAtCycleEnd === true,
+                cancellationRequestedAt:
+                    data.cancellationRequestedAt || null,
+                paidCount:
+                    data.paidCount ?? null,
+                remainingCount:
+                    data.remainingCount ?? null,
+                updatedAt:
+                    data.updatedAt || null,
+            };
+        });
+
+        subscriptions.sort((a, b) => {
+            const aTime =
+                a.updatedAt?.toMillis?.() || 0;
+            const bTime =
+                b.updatedAt?.toMillis?.() || 0;
+
+            return bTime - aTime;
+        });
+
+        return res.status(200).json({
+            success: true,
+            subscriptions,
+        });
+    } catch (error) {
+        console.error("My Subscriptions Error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to load subscriptions",
+        });
+    }
+});
+
+/*
+ * --------------------------------------------------------------------------
  * Cancel Subscription Endpoint (POST /cancel-subscription)
  * --------------------------------------------------------------------------
  */
 
+/*
+ * --------------------------------------------------------------------------
+ * Cancel One Specific Premium Subscription
+ * POST /cancel-subscription
+ * --------------------------------------------------------------------------
+ */
 app.post("/cancel-subscription", requireFirebaseUser, async (req, res) => {
     try {
         const uid = req.uid;
-        const userRef = db.collection("users").doc(uid);
-        const userDoc = await userRef.get();
+        const { subscriptionId } = req.body || {};
 
-        if (!userDoc.exists) {
-            return res.status(404).json({
+        if (!subscriptionId || typeof subscriptionId !== "string") {
+            return res.status(400).json({
                 success: false,
-                message: "User profile not found",
+                message: "Subscription ID is required",
             });
         }
 
-        const userData = userDoc.data() || {};
-        let subscriptionId =
-            userData.razorpaySubscriptionId ||
-            userData.subscriptionId ||
-            null;
+        const subscriptionRef = db
+            .collection("subscriptions")
+            .doc(subscriptionId);
 
-        if (!subscriptionId) {
-            const subQuery = await db
-                .collection("subscriptions")
-                .where("uid", "==", uid)
-                .where("status", "in", ["active", "authenticated"])
-                .limit(1)
-                .get();
+        const subscriptionDoc = await subscriptionRef.get();
 
-            if (!subQuery.empty) {
-                subscriptionId = subQuery.docs[0].id;
-            }
+        if (!subscriptionDoc.exists) {
+            return res.status(404).json({
+                success: false,
+                message: "Subscription not found",
+            });
         }
 
-        if (!subscriptionId) {
+        const subscriptionData = subscriptionDoc.data() || {};
+
+        if (subscriptionData.uid !== uid) {
+            return res.status(403).json({
+                success: false,
+                message: "Subscription does not belong to this account",
+            });
+        }
+
+        const currentStatus = String(
+            subscriptionData.status || ""
+        ).toLowerCase();
+
+        if (
+            ["cancelled", "completed", "expired"].includes(
+                currentStatus
+            )
+        ) {
             return res.status(400).json({
                 success: false,
-                message: "No active Razorpay subscription ID found for this account",
+                message: "This subscription is already inactive",
             });
         }
 
         let cancelledSubscription;
+
         try {
-            // Cancel subscription at the end of current cycle safely
-            cancelledSubscription = await razorpay.subscriptions.cancel(
-                subscriptionId,
-                true
-            );
+            cancelledSubscription =
+                await razorpay.subscriptions.cancel(
+                    subscriptionId,
+                    true
+                );
         } catch (rzpError) {
-            console.warn("Razorpay Cancel Exception:", rzpError.message);
-            // Handle cases where Razorpay already lists the subscription as cancelled or completed
-            cancelledSubscription = { status: "cancelled" };
+            console.error(
+                "Razorpay Cancel Error:",
+                rzpError?.error?.description ||
+                    rzpError?.message ||
+                    rzpError
+            );
+
+            return res.status(502).json({
+                success: false,
+                message:
+                    rzpError?.error?.description ||
+                    rzpError?.message ||
+                    "Razorpay could not cancel this subscription",
+            });
         }
 
         const now = FieldValue.serverTimestamp();
 
-        await userRef.set(
+        await subscriptionRef.set(
             {
-                autoRenew: false,
+                status:
+                    cancelledSubscription?.status ||
+                    "cancelled",
                 cancelAtCycleEnd: true,
-                subscriptionStatus: "cancelled_at_cycle_end",
+                cancellationRequestedAt: now,
                 updatedAt: now,
             },
             { merge: true }
         );
 
-        const subscriptionRef = db.collection("subscriptions").doc(subscriptionId);
-        const subDoc = await subscriptionRef.get();
-        if (subDoc.exists) {
-            await subscriptionRef.set(
-                {
-                    status: "cancelled",
-                    cancelAtCycleEnd: true,
-                    updatedAt: now,
-                },
-                { merge: true }
-            );
-        }
-
         return res.status(200).json({
             success: true,
-            message: "Subscription set to cancel at the end of current billing cycle",
-            subscriptionId: subscriptionId,
-            status: cancelledSubscription.status || "cancelled",
+            message:
+                "Subscription cancellation scheduled successfully. Your current Premium period remains active and automatic renewal is stopped.",
+            subscriptionId,
+            productId: subscriptionData.productId || "",
+            status:
+                cancelledSubscription?.status ||
+                "cancelled",
+            cancelAtCycleEnd: true,
         });
-
     } catch (error) {
-        console.error("Cancel Subscription Error:", error);
+        console.error(
+            "Cancel Subscription Error:",
+            error
+        );
+
         return res.status(500).json({
             success: false,
-            message: error.message || "Failed to cancel subscription",
+            message:
+                error?.message ||
+                "Failed to cancel subscription",
         });
     }
 });
@@ -1131,22 +1220,47 @@ app.post(
             };
 
             if (
-                eventName === "subscription.cancelled" ||
-                eventName === "subscription.completed" ||
-                eventName === "subscription.expired"
-            ) {
-                update.status = subscriptionStatus;
+    eventName === "subscription.cancelled" ||
+    eventName === "subscription.completed" ||
+    eventName === "subscription.expired"
+) {
+    update.status = subscriptionStatus;
 
-                await userRef.set(
-                    {
-                        isPremium: false,
-                        plan: "FREE",
-                        subscriptionStatus: subscriptionStatus,
-                        updatedAt: FieldValue.serverTimestamp(),
-                    },
-                    { merge: true }
-                );
+    const activeSubscriptionsSnapshot = await db
+        .collection("subscriptions")
+        .where("uid", "==", uid)
+        .get();
+
+    const hasAnotherActiveSubscription =
+        activeSubscriptionsSnapshot.docs.some((doc) => {
+            if (doc.id === subscriptionId) {
+                return false;
             }
+
+            const data = doc.data() || {};
+            const status = String(
+                data.status || ""
+            ).toLowerCase();
+
+            return [
+                "active",
+                "authenticated",
+                "pending",
+            ].includes(status);
+        });
+
+    if (!hasAnotherActiveSubscription) {
+        await userRef.set(
+            {
+                isPremium: false,
+                plan: "FREE",
+                subscriptionStatus: subscriptionStatus,
+                updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+        );
+    }
+}
 
             await subscriptionRef.set(update, { merge: true });
 
