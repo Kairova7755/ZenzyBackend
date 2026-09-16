@@ -268,8 +268,38 @@ app.get("/", (req, res) => {
 app.post("/create-order", requireFirebaseUser, async (req, res) => {
     try {
         const { productId } = req.body || {};
-        const uid = req.uid;
-        const product = getProduct(productId);
+const uid = req.uid;
+
+// Prevent purchasing the SAME Premium plan again while
+// an existing subscription for that plan is still active.
+if (productId === "monthly" || productId === "yearly") {
+    const existingSubscriptions = await db
+        .collection("subscriptions")
+        .where("uid", "==", uid)
+        .where("productId", "==", productId)
+        .get();
+
+    const hasActiveSamePlan = existingSubscriptions.docs.some((doc) => {
+        const data = doc.data() || {};
+        const status = String(data.status || "").toLowerCase();
+
+        return (
+            ["active", "authenticated", "pending"].includes(status) ||
+            data.cancelAtCycleEnd === true
+        );
+    });
+
+    if (hasActiveSamePlan) {
+        return res.status(409).json({
+            success: false,
+            error: "This Premium plan is already purchased. Cancel the existing plan before purchasing it again.",
+            code: "PLAN_ALREADY_PURCHASED",
+            productId,
+        });
+    }
+}
+
+const product = getProduct(productId);
 
         if (!productId || !product) {
             return res.status(400).json({ error: "Invalid product selected" });
@@ -824,6 +854,124 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
         return res.status(500).json({
             success: false,
             message: "Failed to process and verify payment",
+        });
+    }
+});
+
+/*
+ * --------------------------------------------------------------------------
+ * Get Transaction History (GET /my-transactions)
+ * --------------------------------------------------------------------------
+ */
+app.get("/my-transactions", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+
+        const snapshot = await db
+            .collection("payments")
+            .where("uid", "==", uid)
+            .get();
+
+        const transactions = snapshot.docs.map((doc) => {
+            const data = doc.data() || {};
+
+            const productId = data.productId || "";
+            const product = getProduct(productId);
+
+            let transactionType = "RUBY";
+
+            if (
+                data.type === "subscription_initial" ||
+                data.productType === "premium_renewal" ||
+                data.subscriptionId ||
+                data.razorpaySubscriptionId
+            ) {
+                transactionType = "PREMIUM";
+            }
+
+            const timestamp =
+                data.createdAt ||
+                data.processedAt ||
+                null;
+
+            let dateTimeMillis = null;
+
+            if (timestamp && typeof timestamp.toMillis === "function") {
+                dateTimeMillis = timestamp.toMillis();
+            } else if (timestamp instanceof Date) {
+                dateTimeMillis = timestamp.getTime();
+            } else if (typeof timestamp === "number") {
+                dateTimeMillis = timestamp;
+            }
+
+            const amountPaise =
+                Number(
+                    data.amountPaise ??
+                    data.amount ??
+                    0
+                );
+
+            const amountRupees =
+                data.amountRupees != null
+                    ? Number(data.amountRupees)
+                    : amountPaise / 100;
+
+            return {
+                transactionId: doc.id,
+                type: transactionType,
+                productId: productId,
+                productName:
+                    data.productName ||
+                    product?.name ||
+                    product?.description ||
+                    productId,
+
+                amountRupees: amountRupees,
+                amountPaise: amountPaise,
+
+                aCoinReward:
+                    Number(data.aCoinReward ?? product?.aCoinReward ?? 0),
+
+                status:
+                    data.status ||
+                    data.paymentStatus ||
+                    "captured",
+
+                paymentId:
+                    data.paymentId ||
+                    data.razorpayPaymentId ||
+                    "",
+
+                orderId:
+                    data.orderId ||
+                    "",
+
+                subscriptionId:
+                    data.subscriptionId ||
+                    data.razorpaySubscriptionId ||
+                    "",
+
+                dateTimeMillis: dateTimeMillis,
+            };
+        });
+
+        transactions.sort((a, b) => {
+            return (
+                Number(b.dateTimeMillis || 0) -
+                Number(a.dateTimeMillis || 0)
+            );
+        });
+
+        return res.status(200).json({
+            success: true,
+            transactions,
+        });
+    } catch (error) {
+        console.error("My Transactions Error:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to load transaction history",
         });
     }
 });
