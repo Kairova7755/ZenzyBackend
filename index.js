@@ -383,7 +383,10 @@ app.post("/create-subscription", requireFirebaseUser, async (req, res) => {
             plan_id: planId,
 
             // Keep existing Zenzy billing-cycle configuration.
-            total_count: productId === "monthly" ? 120 : 10,
+            total_count:
+    productId === "monthly"
+        ? Number(process.env.RAZORPAY_MONTHLY_TOTAL_COUNT)
+        : Number(process.env.RAZORPAY_YEARLY_TOTAL_COUNT),
 
             quantity: 1,
 
