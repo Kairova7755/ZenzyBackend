@@ -339,10 +339,7 @@ if (productId === "monthly" || productId === "yearly") {
         const data = doc.data() || {};
         const status = String(data.status || "").toLowerCase();
 
-        return (
-            ["active", "authenticated", "pending"].includes(status) ||
-            data.cancelAtCycleEnd === true
-        );
+        return ["active", "authenticated", "pending"].includes(status);
     });
 
     if (hasActiveSamePlan) {
