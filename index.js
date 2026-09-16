@@ -627,8 +627,8 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
                 });
 
                 transaction.update(userRef, {
-                    aCoins: currentCoins + product.aCoinReward,
-                    acoin: currentCoins + product.aCoinReward,
+                    aCoins: currentCoins,
+                    acoin: currentCoins,
                     isPremium: true,
                     plan: productId === "monthly" ? "MONTHLY" : "YEARLY",
                     subscriptionType: productId,
