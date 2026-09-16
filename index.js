@@ -663,9 +663,10 @@ const currentCoins = Math.max(
                     subscriptionId: razorpay_subscription_id,
                     uid: uid,
                     productId: productId,
-                    amount: product.amountInPaise,
-                    type: "subscription_initial",
-                    status: "captured",
+                   amount: product.amountInPaise,
+aCoinReward: 0,
+type: "subscription_initial",
+status: "captured",
                     createdAt: FieldValue.serverTimestamp(),
                 });
 
@@ -709,7 +710,7 @@ const currentCoins = Math.max(
 
                 transaction.set(notificationRef, {
                     title: "Premium Activated",
-                    message: `Welcome to Zenzy Premium! You received ${product.aCoinReward} A-Coins for activating ${product.name}.`,
+                   message: `Welcome to Zenzy Premium! Your ${product.name} trial has started. A-Coins will be credited only after the first successful renewal payment of ₹${product.renewalAmountRupees}.`,
                     type: "payment",
                     createdAt: FieldValue.serverTimestamp(),
                     read: false,
@@ -721,8 +722,8 @@ const currentCoins = Math.max(
                 message: "Subscription verified successfully",
                 subscriptionId: razorpay_subscription_id,
                 productId: productId,
-                aCoinReward: product.aCoinReward,
-                aCoinAwarded: product.aCoinReward,
+              aCoinReward: 0,
+aCoinAwarded: 0,
             });
         }
 
@@ -1326,6 +1327,30 @@ app.post(
                 const expectedRenewalAmount = rupeesToPaise(
                     product.renewalAmountRupees || product.amountRupees
                 );
+
+                const actualChargedAmount = Number(paymentEntity.amount || 0);
+
+// Only a successful recurring renewal gets the Premium A-Coin reward.
+// Never reward the initial ₹1 authorization.
+if (actualChargedAmount !== expectedRenewalAmount) {
+    console.log(
+        "ZENZY SUBSCRIPTION CHARGE IGNORED (NOT RENEWAL):",
+        JSON.stringify({
+            uid,
+            productId,
+            subscriptionId,
+            paymentId,
+            actualChargedAmount,
+            expectedRenewalAmount,
+        })
+    );
+
+    return res.json({
+        success: true,
+        ignored: true,
+        reason: "NOT_RENEWAL_CHARGE",
+    });
+}
 
                 const paymentRef = db.collection("payments").doc(paymentId);
 
