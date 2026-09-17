@@ -128,11 +128,11 @@ const PRODUCTS = {
         aCoinReward: 80,
         description: "80 A-Coins Pack",
     },
-    coin_199: {
-        id: "coin_199",
+    coin_210: {
+        id: "coin_210",
         type: "pack",
         name: "Popular A-Coin",
-        amountInPaise: 21000, // ₹210
+        amountInPaise: 19900, // ₹210
         amountRupees: 210,
         aCoinReward: 200,
         description: "200 A-Coins Pack",
