@@ -1528,6 +1528,7 @@ app.post(
                 photoUrls,
                 photoCount,
                 photoSelected,
+                generationMode,
                 videoDurationSeconds,
                 aCoinCost,
                 quality,
@@ -1562,12 +1563,31 @@ app.post(
                   )
                 : [];
 
-            if (urls.length < 1 || urls.length > 5) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Please provide 1 to 5 uploaded photos",
-                });
-            }
+            const mode =
+    typeof generationMode === "string" &&
+    generationMode.toUpperCase() === "TEXT"
+        ? "TEXT"
+        : "IMAGE";
+
+if (
+    mode === "IMAGE" &&
+    (urls.length < 1 || urls.length > 5)
+) {
+    return res.status(400).json({
+        success: false,
+        message: "Please provide 1 to 5 uploaded photos",
+    });
+}
+
+if (
+    mode === "TEXT" &&
+    (!description || !String(description).trim())
+) {
+    return res.status(400).json({
+        success: false,
+        message: "Please provide a text prompt for Text-to-Video mode",
+    });
+}
 
             const uid = req.uid;
 
@@ -1654,19 +1674,23 @@ app.post(
                                 : "FREE",
 
                         photoUrl:
-                            typeof photoUrl === "string" &&
-                            photoUrl.trim()
-                                ? photoUrl
-                                : urls[0],
+    mode === "IMAGE" &&
+    typeof photoUrl === "string" &&
+    photoUrl.trim()
+        ? photoUrl
+        : (mode === "IMAGE" ? urls[0] : ""),
 
                         photoUrls: urls,
 
-                        photoCount:
-                            Number(photoCount) ||
-                            urls.length,
+                        generationMode: mode,
 
-                        photoSelected:
-                            photoSelected !== false,
+                        photoCount:
+    mode === "IMAGE"
+        ? (Number(photoCount) || urls.length)
+        : 0,
+
+                       photoSelected:
+    mode === "IMAGE",
 
                         videoDurationSeconds:
                             duration,
