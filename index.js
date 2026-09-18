@@ -326,10 +326,12 @@ app.post("/create-subscription", requireFirebaseUser, async (req, res) => {
         const { productId } = req.body || {};
 const uid = req.uid;
 
-// Premium is one active subscription per account.
-// Monthly OR Yearly Premium means no second Premium purchase.
-if (productId === "monthly" || productId === "yearly") {
-    const userRef = db.collection("users").doc(uid);
+// Users may have both Monthly and Yearly Premium subscriptions.
+// The user decides which plans to purchase.
+const product = getProduct(productId);
+
+// Only Premium subscription products are allowed here.
+if (!productId || !product || product.type !== "subscription") {
 
     const userSnapshot = await userRef.get();
     const userData = userSnapshot.exists
@@ -641,17 +643,6 @@ app.post("/verify-payment", requireFirebaseUser, async (req, res) => {
 
                const userData = userDoc.data() || {};
 
-// Do not activate/reward a second Premium subscription.
-const existingPremiumSubscriptionId =
-    String(userData.razorpaySubscriptionId || "").trim();
-
-if (
-    userData.isPremium === true &&
-    existingPremiumSubscriptionId &&
-    existingPremiumSubscriptionId !== razorpay_subscription_id
-) {
-    throw new Error("PREMIUM_ALREADY_ACTIVE");
-}
 
 const currentCoins = Math.max(
     0,
