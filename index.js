@@ -1248,14 +1248,6 @@ app.post(
                 .update(req.body)
                 .digest("hex");
 
-            console.log("WEBHOOK DEBUG:", {
-    secretConfigured: Boolean(webhookSecret),
-    secretLength: webhookSecret.length,
-    signatureReceived: Boolean(signature),
-    signatureLength: signature ? String(signature).length : 0,
-    bodyIsBuffer: Buffer.isBuffer(req.body),
-    bodyLength: Buffer.isBuffer(req.body) ? req.body.length : null,
-});
 
             if (!safeEqualHex(expectedSignature, signature)) {
                 console.error("RAZORPAY WEBHOOK SIGNATURE MISMATCH");
