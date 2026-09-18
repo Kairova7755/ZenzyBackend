@@ -324,67 +324,12 @@ const product = getProduct(productId);
 app.post("/create-subscription", requireFirebaseUser, async (req, res) => {
     try {
         const { productId } = req.body || {};
-const uid = req.uid;
+        const uid = req.uid;
 
-// Users may have both Monthly and Yearly Premium subscriptions.
-// The user decides which plans to purchase.
-const product = getProduct(productId);
+        // Users may have both Monthly and Yearly Premium subscriptions.
+        // The user decides which plans to purchase.
+        const product = getProduct(productId);
 
-// Only Premium subscription products are allowed here.
-if (!productId || !product || product.type !== "subscription") {
-
-    const userSnapshot = await userRef.get();
-    const userData = userSnapshot.exists
-        ? (userSnapshot.data() || {})
-        : {};
-
-    const userPremiumActive =
-        userData.isPremium === true ||
-        ["MONTHLY", "YEARLY"].includes(
-            String(userData.plan || "").toUpperCase()
-        );
-
-    const existingSubscriptions = await db
-        .collection("subscriptions")
-        .where("uid", "==", uid)
-        .get();
-
-    const hasActivePremiumSubscription =
-        existingSubscriptions.docs.some((doc) => {
-            const data = doc.data() || {};
-
-            const subscriptionProduct =
-                String(data.productId || "").toLowerCase();
-
-            const status =
-                String(data.status || "").toLowerCase();
-
-            return (
-                (subscriptionProduct === "monthly" ||
-                    subscriptionProduct === "yearly") &&
-                (
-                    [
-                        "active",
-                        "authenticated",
-                        "pending",
-                        "created",
-                    ].includes(status) ||
-                    data.cancelAtCycleEnd === true
-                )
-            );
-        });
-
-    if (userPremiumActive || hasActivePremiumSubscription) {
-        return res.status(409).json({
-            success: false,
-            error:
-                "Premium is already active for this account. You cannot purchase another Premium plan.",
-            code: "PREMIUM_ALREADY_ACTIVE",
-        });
-    }
-}
-
-const product = getProduct(productId);
         // Only Premium subscription products are allowed here.
         if (!productId || !product || product.type !== "subscription") {
             return res.status(400).json({
@@ -392,6 +337,117 @@ const product = getProduct(productId);
                 error: "Invalid subscription product selected",
             });
         }
+
+        // Get Razorpay Plan ID from environment variables.
+        const planId = getSubscriptionPlanId(productId);
+
+        if (!planId) {
+            console.error(
+                `Missing Razorpay plan ID for subscription product: ${productId}`
+            );
+
+            return res.status(500).json({
+                success: false,
+                error: "Subscription plan configuration missing on server",
+            });
+        }
+
+        const startAt = getSubscriptionStartAt(product);
+
+        const expireBy =
+            Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+
+        const subscriptionOptions = {
+            plan_id: planId,
+
+            total_count:
+                productId === "monthly"
+                    ? Number(process.env.RAZORPAY_MONTHLY_TOTAL_COUNT)
+                    : Number(process.env.RAZORPAY_YEARLY_TOTAL_COUNT),
+
+            quantity: 1,
+            start_at: startAt,
+            expire_by: expireBy,
+            customer_notify: true,
+
+            addons: [
+                {
+                    item: {
+                        name: "Zenzy Premium Authorization",
+                        amount: product.amountInPaise,
+                        currency: "INR",
+                    },
+                },
+            ],
+
+            notes: {
+                uid: uid,
+                productId: product.id,
+            },
+        };
+
+        const subscription =
+            await razorpay.subscriptions.create(subscriptionOptions);
+
+        if (!subscription || !subscription.id) {
+            console.error(
+                "Razorpay did not return a valid subscription ID:",
+                subscription
+            );
+
+            return res.status(502).json({
+                success: false,
+                error: "Razorpay subscription creation failed",
+            });
+        }
+
+        console.log(
+            "ZENZY SUBSCRIPTION CREATED:",
+            JSON.stringify({
+                uid,
+                productId,
+                subscriptionId: subscription.id,
+                planId,
+                startAt,
+                expireBy,
+                status: subscription.status,
+            })
+        );
+
+        return res.status(200).json({
+            success: true,
+            subscriptionId: subscription.id,
+            keyId: process.env.RAZORPAY_KEY_ID,
+            id: subscription.id,
+            productId: product.id,
+            productName: product.name,
+            amount: product.amountInPaise,
+            currency: "INR",
+            status: subscription.status,
+            trialEndsAt: startAt,
+            planId: subscription.plan_id || planId,
+            notes: subscription.notes || {
+                uid,
+                productId: product.id,
+            },
+        });
+    } catch (error) {
+        console.error(
+            "Create Subscription Error:",
+            error?.error?.description ||
+                error?.message ||
+                error
+        );
+
+        return res.status(500).json({
+            success: false,
+            error:
+                error?.error?.description ||
+                error?.message ||
+                "Failed to create Razorpay subscription",
+        });
+    }
+});
 
         // Get Razorpay Plan ID from environment variables.
         const planId = getSubscriptionPlanId(productId);
