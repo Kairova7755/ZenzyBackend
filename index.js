@@ -64,6 +64,8 @@ initializeApp({
 const db = getFirestore();
 const adminAuth = getAuth();
 
+const FIRST_TIME_OFFER_WINDOW_MS = 12 * 60 * 60 * 1000;
+
 /*
  * --------------------------------------------------------------------------
  * Razorpay
@@ -119,6 +121,17 @@ const PRODUCTS = {
         aCoinReward: 100,
         description: "100 Ruby New User Offer",
         newUserOnly: true,
+    },
+    first_time_20_ruby: {
+        id: "first_time_20_ruby",
+        type: "pack",
+        name: "First Time 20 Ruby Offer",
+        amountInPaise: 100, // ₹1
+        amountRupees: 1,
+        aCoinReward: 20,
+        description: "20 Ruby First Time Offer",
+        newUserOnly: true,
+        firstTimeOnly: true,
     },
     coin_49: {
         id: "coin_49",
@@ -286,30 +299,34 @@ app.get("/new-user-offer-status", requireFirebaseUser, async (req, res) => {
     try {
         const uid = req.uid;
         const userDoc = await db.collection("users").doc(uid).get();
+        const userData = userDoc.exists ? (userDoc.data() || {}) : {};
 
-        if (!userDoc.exists) {
-            return res.status(200).json({
-                success: true,
-                eligible: false,
-                claimed: false,
-            });
-        }
+        const authUser = await adminAuth.getUser(uid);
+        const accountCreatedAt = new Date(authUser.metadata.creationTime).getTime();
+        const firstTimeOfferExpiresAt = accountCreatedAt + FIRST_TIME_OFFER_WINDOW_MS;
+        const firstTimeOfferEligible =
+            Date.now() < firstTimeOfferExpiresAt &&
+            userData.firstTimeOfferClaimed !== true;
 
-        const data = userDoc.data() || {};
-        const eligible =
-            data.newUserOfferEligible === true &&
-            data.newUserOfferClaimed !== true;
+        const newUserOfferEligible =
+            userData.newUserOfferEligible === true &&
+            userData.newUserOfferClaimed !== true;
 
         return res.status(200).json({
             success: true,
-            eligible,
-            claimed: data.newUserOfferClaimed === true,
+            eligible: newUserOfferEligible,
+            claimed: userData.newUserOfferClaimed === true,
+            firstTimeOfferEligible,
+            firstTimeOfferClaimed: userData.firstTimeOfferClaimed === true,
+            firstTimeOfferExpiresAt,
         });
     } catch (error) {
         console.error("New User Offer Status Error:", error);
         return res.status(500).json({
             success: false,
             eligible: false,
+            firstTimeOfferEligible: false,
+            firstTimeOfferExpiresAt: 0,
             message: "Could not check new user offer status",
         });
     }
@@ -332,8 +349,8 @@ const product = getProduct(productId);
             });
         }
 
-        // The ₹29 / 100 Ruby offer is strictly one-time and server-controlled.
-        if (productId === "new_user_100_ruby") {
+        // New-user offers are strictly one-time and server-controlled.
+        if (productId === "new_user_100_ruby" || productId === "first_time_20_ruby") {
             const userDoc = await db.collection("users").doc(uid).get();
 
             if (!userDoc.exists) {
@@ -345,20 +362,44 @@ const product = getProduct(productId);
 
             const userData = userDoc.data() || {};
 
-            if (userData.newUserOfferEligible !== true) {
-                return res.status(403).json({
-                    success: false,
-                    error: "This new user offer is not available for this account",
-                    code: "NEW_USER_OFFER_NOT_ELIGIBLE",
-                });
+            if (productId === "new_user_100_ruby") {
+                if (userData.newUserOfferEligible !== true) {
+                    return res.status(403).json({
+                        success: false,
+                        error: "This new user offer is not available for this account",
+                        code: "NEW_USER_OFFER_NOT_ELIGIBLE",
+                    });
+                }
+
+                if (userData.newUserOfferClaimed === true) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "This new user offer has already been used",
+                        code: "NEW_USER_OFFER_ALREADY_CLAIMED",
+                    });
+                }
             }
 
-            if (userData.newUserOfferClaimed === true) {
-                return res.status(409).json({
-                    success: false,
-                    error: "This new user offer has already been used",
-                    code: "NEW_USER_OFFER_ALREADY_CLAIMED",
-                });
+            if (productId === "first_time_20_ruby") {
+                const authUser = await adminAuth.getUser(uid);
+                const accountCreatedAt = new Date(authUser.metadata.creationTime).getTime();
+                const expiresAt = accountCreatedAt + FIRST_TIME_OFFER_WINDOW_MS;
+
+                if (Date.now() >= expiresAt) {
+                    return res.status(410).json({
+                        success: false,
+                        error: "The 12-hour first-time offer has expired",
+                        code: "FIRST_TIME_OFFER_EXPIRED",
+                    });
+                }
+
+                if (userData.firstTimeOfferClaimed === true) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "The first-time offer has already been used",
+                        code: "FIRST_TIME_OFFER_ALREADY_CLAIMED",
+                    });
+                }
             }
         }
 
@@ -802,8 +843,9 @@ aCoinAwarded: 0,
                 Number(userData.aCoins || userData.acoin || 0)
             );
 
-            // Final server-side gate. Even if multiple ₹29 orders were opened,
-            // only the first verified payment can claim the one-time offer.
+            // Final server-side gate. Only the first verified payment can claim
+            // each one-time new-user offer. The first-time ₹1 offer is also
+            // checked against Firebase Auth account creation time.
             if (productId === "new_user_100_ruby") {
                 if (userData.newUserOfferEligible !== true) {
                     throw new Error("NEW_USER_OFFER_NOT_ELIGIBLE");
@@ -811,6 +853,20 @@ aCoinAwarded: 0,
 
                 if (userData.newUserOfferClaimed === true) {
                     throw new Error("NEW_USER_OFFER_ALREADY_CLAIMED");
+                }
+            }
+
+            if (productId === "first_time_20_ruby") {
+                const authUser = await adminAuth.getUser(uid);
+                const accountCreatedAt = new Date(authUser.metadata.creationTime).getTime();
+                const expiresAt = accountCreatedAt + FIRST_TIME_OFFER_WINDOW_MS;
+
+                if (Date.now() >= expiresAt) {
+                    throw new Error("FIRST_TIME_OFFER_EXPIRED");
+                }
+
+                if (userData.firstTimeOfferClaimed === true) {
+                    throw new Error("FIRST_TIME_OFFER_ALREADY_CLAIMED");
                 }
             }
 
@@ -824,9 +880,11 @@ aCoinAwarded: 0,
                 amountRupees: product.amountRupees,
                 aCoinReward: product.aCoinReward,
                 status: payment.status,
-                type: productId === "new_user_100_ruby"
-                    ? "new_user_offer"
-                    : "ruby_pack",
+                type: productId === "first_time_20_ruby"
+                    ? "first_time_offer"
+                    : productId === "new_user_100_ruby"
+                        ? "new_user_offer"
+                        : "ruby_pack",
                 createdAt: FieldValue.serverTimestamp(),
             });
 
@@ -839,6 +897,11 @@ aCoinAwarded: 0,
             if (productId === "new_user_100_ruby") {
                 updateData.newUserOfferClaimed = true;
                 updateData.newUserOfferClaimedAt = FieldValue.serverTimestamp();
+            }
+
+            if (productId === "first_time_20_ruby") {
+                updateData.firstTimeOfferClaimed = true;
+                updateData.firstTimeOfferClaimedAt = FieldValue.serverTimestamp();
             }
 
             transaction.update(userRef, updateData);
@@ -881,6 +944,22 @@ aCoinAwarded: 0,
                 success: false,
                 message: "This new user offer has already been used",
                 code: "NEW_USER_OFFER_ALREADY_CLAIMED",
+            });
+        }
+
+        if (error.message === "FIRST_TIME_OFFER_ALREADY_CLAIMED") {
+            return res.status(409).json({
+                success: false,
+                message: "The first-time offer has already been used",
+                code: "FIRST_TIME_OFFER_ALREADY_CLAIMED",
+            });
+        }
+
+        if (error.message === "FIRST_TIME_OFFER_EXPIRED") {
+            return res.status(410).json({
+                success: false,
+                message: "The 12-hour first-time offer has expired",
+                code: "FIRST_TIME_OFFER_EXPIRED",
             });
         }
 
