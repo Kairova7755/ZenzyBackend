@@ -68,6 +68,70 @@ const FIRST_TIME_OFFER_WINDOW_MS = 12 * 60 * 60 * 1000;
 
 /*
  * --------------------------------------------------------------------------
+ * Referral / Invite & Earn
+ * --------------------------------------------------------------------------
+ * Signup reward:
+ *   Referred friend signs up through a valid invite -> referrer +50 Ruby.
+ *
+ * First Ruby purchase reward:
+ *   Referred friend completes their first successful Ruby-pack payment
+ *   (any Ruby pack/offer amount, including the ₹1 first-time offer) ->
+ *   referrer +100 Ruby and referred friend +30 Ruby.
+ *
+ * All referral rewards are server-side and transaction protected.
+ */
+const REFERRAL_SIGNUP_REWARD = 50;
+const REFERRAL_FIRST_PURCHASE_REFERRER_REWARD = 100;
+const REFERRAL_FIRST_PURCHASE_FRIEND_REWARD = 30;
+
+function makeReferralCode(uid) {
+    const clean = String(uid || "")
+        .replace(/[^a-zA-Z0-9]/g, "")
+        .toUpperCase();
+
+    // 10-12 chars keeps the share code short while remaining tied to the UID.
+    return `Z${clean.slice(0, 11)}`;
+}
+
+function cleanReferralCode(value) {
+    return String(value || "")
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9]/g, "")
+        .slice(0, 20);
+}
+
+async function ensureReferralCode(uid) {
+    const userRef = db.collection("users").doc(uid);
+    const userDoc = await userRef.get();
+
+    if (!userDoc.exists) {
+        throw new Error("USER_NOT_FOUND");
+    }
+
+    const userData = userDoc.data() || {};
+    const existing = cleanReferralCode(userData.referralCode);
+
+    if (existing) {
+        return existing;
+    }
+
+    const code = makeReferralCode(uid);
+
+    await userRef.set(
+        {
+            referralCode: code,
+            updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+    );
+
+    return code;
+}
+
+
+/*
+ * --------------------------------------------------------------------------
  * Razorpay
  * --------------------------------------------------------------------------
  */
@@ -328,6 +392,255 @@ app.get("/new-user-offer-status", requireFirebaseUser, async (req, res) => {
             firstTimeOfferEligible: false,
             firstTimeOfferExpiresAt: 0,
             message: "Could not check new user offer status",
+        });
+    }
+});
+
+
+/*
+ * --------------------------------------------------------------------------
+ * Referral Status (GET /referral-status)
+ * --------------------------------------------------------------------------
+ */
+app.get("/referral-status", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+        const referralCode = await ensureReferralCode(uid);
+
+        const userDoc = await db.collection("users").doc(uid).get();
+        const userData = userDoc.data() || {};
+
+        const referralsSnapshot = await db
+            .collection("referrals")
+            .where("referrerUid", "==", uid)
+            .get();
+
+        let invitedCount = 0;
+        let firstPurchaseRewardedCount = 0;
+        let totalEarned = 0;
+
+        referralsSnapshot.forEach((doc) => {
+            const data = doc.data() || {};
+            invitedCount += 1;
+
+            if (data.firstPurchaseRewarded === true) {
+                firstPurchaseRewardedCount += 1;
+            }
+
+            totalEarned += Number(data.referrerRewardTotal || 0);
+        });
+
+        return res.status(200).json({
+            success: true,
+            referralCode,
+            referralLink:
+                `https://kairova7755.github.io/zenzy-website/?ref=${encodeURIComponent(referralCode)}`,
+            invitedCount,
+            firstPurchaseRewardedCount,
+            totalEarned,
+            referredBy: userData.referredBy || null,
+            referralFirstPurchaseRewarded:
+                userData.referralFirstPurchaseRewarded === true,
+        });
+    } catch (error) {
+        console.error("Referral Status Error:", error);
+
+        if (error.message === "USER_NOT_FOUND") {
+            return res.status(404).json({
+                success: false,
+                message: "User profile not found",
+            });
+        }
+
+        return res.status(500).json({
+            success: false,
+            message: "Could not load referral status",
+        });
+    }
+});
+
+/*
+ * --------------------------------------------------------------------------
+ * Attach Invite / Referral Code (POST /referral-attach)
+ * --------------------------------------------------------------------------
+ * Called after a newly created account opens a shared Zenzy invite.
+ * The +50 Ruby signup reward is credited here, exactly once.
+ * --------------------------------------------------------------------------
+ */
+app.post("/referral-attach", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+        const referralCode = cleanReferralCode(req.body?.referralCode);
+
+        if (!referralCode) {
+            return res.status(400).json({
+                success: false,
+                message: "Referral code is required",
+            });
+        }
+
+        const referrerSnapshot = await db
+            .collection("users")
+            .where("referralCode", "==", referralCode)
+            .limit(1)
+            .get();
+
+        if (referrerSnapshot.empty) {
+            return res.status(404).json({
+                success: false,
+                message: "Referral code not found",
+                code: "REFERRAL_CODE_NOT_FOUND",
+            });
+        }
+
+        const referrerDoc = referrerSnapshot.docs[0];
+        const referrerUid = referrerDoc.id;
+
+        if (referrerUid === uid) {
+            return res.status(400).json({
+                success: false,
+                message: "You cannot use your own referral code",
+                code: "SELF_REFERRAL_NOT_ALLOWED",
+            });
+        }
+
+        const userRef = db.collection("users").doc(uid);
+        const referrerRef = db.collection("users").doc(referrerUid);
+        const referralRef = db.collection("referrals").doc(uid);
+
+        await db.runTransaction(async (transaction) => {
+            const userDoc = await transaction.get(userRef);
+
+            if (!userDoc.exists) {
+                throw new Error("USER_NOT_FOUND");
+            }
+
+            const existingReferralDoc = await transaction.get(referralRef);
+
+            // Idempotent: if this account already has a referral attribution,
+            // never award another signup reward.
+            if (existingReferralDoc.exists) {
+                throw new Error("REFERRAL_ALREADY_ATTACHED");
+            }
+
+            const userData = userDoc.data() || {};
+
+            if (userData.referredBy) {
+                throw new Error("REFERRAL_ALREADY_ATTACHED");
+            }
+
+            const referrerDocInTransaction = await transaction.get(referrerRef);
+
+            if (!referrerDocInTransaction.exists) {
+                throw new Error("REFERRER_NOT_FOUND");
+            }
+
+            const referrerData = referrerDocInTransaction.data() || {};
+            const referrerCoins = Math.max(
+                0,
+                Number(referrerData.aCoins || referrerData.acoin || 0)
+            );
+
+            const friendCoins = Math.max(
+                0,
+                Number(userData.aCoins || userData.acoin || 0)
+            );
+
+            transaction.update(referrerRef, {
+                aCoins: referrerCoins + REFERRAL_SIGNUP_REWARD,
+                acoin: referrerCoins + REFERRAL_SIGNUP_REWARD,
+                referralRubyEarned:
+                    Number(referrerData.referralRubyEarned || 0) +
+                    REFERRAL_SIGNUP_REWARD,
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+
+            transaction.set(
+                userRef,
+                {
+                    referredBy: referrerUid,
+                    referredByCode: referralCode,
+                    referralSignupRewarded: true,
+                    referralSignupRewardedAt: FieldValue.serverTimestamp(),
+                    aCoins: friendCoins,
+                    acoin: friendCoins,
+                    updatedAt: FieldValue.serverTimestamp(),
+                },
+                { merge: true }
+            );
+
+            transaction.set(referralRef, {
+                referrerUid,
+                referredUid: uid,
+                referralCode,
+                signupRewarded: true,
+                signupReward: REFERRAL_SIGNUP_REWARD,
+                firstPurchaseRewarded: false,
+                referrerRewardTotal: REFERRAL_SIGNUP_REWARD,
+                friendRewardTotal: 0,
+                createdAt: FieldValue.serverTimestamp(),
+                updatedAt: FieldValue.serverTimestamp(),
+            });
+
+            const notificationRef = userRef
+                .collection("notifications")
+                .doc();
+
+            transaction.set(notificationRef, {
+                title: "Referral Joined",
+                message: `Your friend invited you to Zenzy. Your referrer received ${REFERRAL_SIGNUP_REWARD} Ruby.`,
+                type: "referral",
+                createdAt: FieldValue.serverTimestamp(),
+                read: false,
+            });
+
+            const referrerNotificationRef = referrerRef
+                .collection("notifications")
+                .doc();
+
+            transaction.set(referrerNotificationRef, {
+                title: "Friend Joined Zenzy",
+                message: `Your friend joined using your invite. +${REFERRAL_SIGNUP_REWARD} Ruby added.`,
+                type: "referral",
+                createdAt: FieldValue.serverTimestamp(),
+                read: false,
+            });
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: `Referral applied. ${REFERRAL_SIGNUP_REWARD} Ruby added to the referrer.`,
+            referralCode,
+            signupReward: REFERRAL_SIGNUP_REWARD,
+        });
+    } catch (error) {
+        console.error("Referral Attach Error:", error);
+
+        if (error.message === "USER_NOT_FOUND") {
+            return res.status(404).json({
+                success: false,
+                message: "Zenzy user account not found",
+            });
+        }
+
+        if (error.message === "REFERRER_NOT_FOUND") {
+            return res.status(404).json({
+                success: false,
+                message: "Referral owner account not found",
+            });
+        }
+
+        if (error.message === "REFERRAL_ALREADY_ATTACHED") {
+            return res.status(409).json({
+                success: false,
+                message: "A referral has already been attached to this account",
+                code: "REFERRAL_ALREADY_ATTACHED",
+            });
+        }
+
+        return res.status(500).json({
+            success: false,
+            message: "Could not apply referral code",
         });
     }
 });
@@ -826,6 +1139,9 @@ aCoinAwarded: 0,
         const paymentRef = db.collection("payments").doc(razorpay_payment_id);
         const userRef = db.collection("users").doc(uid);
 
+        let referralFirstPurchaseRewarded = false;
+        let referralReferrerUid = null;
+
         await db.runTransaction(async (transaction) => {
             const paymentDoc = await transaction.get(paymentRef);
             if (paymentDoc.exists) {
@@ -904,6 +1220,127 @@ aCoinAwarded: 0,
                 updateData.firstTimeOfferClaimedAt = FieldValue.serverTimestamp();
             }
 
+            /*
+             * Referral first-purchase reward:
+             * Any successful Ruby pack/offer purchase counts, including
+             * the ₹1 first-time Ruby offer and ₹29 new-user Ruby offer.
+             * Premium subscriptions are never included.
+             */
+            if (
+                product.type === "pack" &&
+                userData.referredBy &&
+                userData.referralFirstPurchaseRewarded !== true
+            ) {
+                const referralRef = db
+                    .collection("referrals")
+                    .doc(uid);
+
+                const referralSnapshot = await transaction.get(referralRef);
+
+                if (referralSnapshot.exists) {
+                    const referralData = referralSnapshot.data() || {};
+                    referralReferrerUid =
+                        referralData.referrerUid || userData.referredBy;
+
+                    if (
+                        referralReferrerUid &&
+                        referralReferrerUid !== uid &&
+                        referralData.firstPurchaseRewarded !== true
+                    ) {
+                        const referrerRef = db
+                            .collection("users")
+                            .doc(referralReferrerUid);
+
+                        const referrerSnapshot =
+                            await transaction.get(referrerRef);
+
+                        if (referrerSnapshot.exists) {
+                            const referrerData =
+                                referrerSnapshot.data() || {};
+
+                            const referrerCoins = Math.max(
+                                0,
+                                Number(
+                                    referrerData.aCoins ||
+                                    referrerData.acoin ||
+                                    0
+                                )
+                            );
+
+                            updateData.aCoins +=
+                                REFERRAL_FIRST_PURCHASE_FRIEND_REWARD;
+                            updateData.acoin +=
+                                REFERRAL_FIRST_PURCHASE_FRIEND_REWARD;
+                            updateData.referralFirstPurchaseRewarded = true;
+                            updateData.referralFirstPurchaseRewardedAt =
+                                FieldValue.serverTimestamp();
+
+                            transaction.update(referrerRef, {
+                                aCoins:
+                                    referrerCoins +
+                                    REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                acoin:
+                                    referrerCoins +
+                                    REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                referralRubyEarned:
+                                    Number(
+                                        referrerData.referralRubyEarned || 0
+                                    ) +
+                                    REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                updatedAt: FieldValue.serverTimestamp(),
+                            });
+
+                            transaction.set(
+                                referralRef,
+                                {
+                                    firstPurchaseRewarded: true,
+                                    firstPurchaseProductId: productId,
+                                    firstPurchasePaymentId:
+                                        razorpay_payment_id,
+                                    firstPurchaseRewardedAt:
+                                        FieldValue.serverTimestamp(),
+                                    referrerRewardTotal:
+                                        Number(
+                                            referralData.referrerRewardTotal ||
+                                            0
+                                        ) +
+                                        REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                    friendRewardTotal:
+                                        Number(
+                                            referralData.friendRewardTotal ||
+                                            0
+                                        ) +
+                                        REFERRAL_FIRST_PURCHASE_FRIEND_REWARD,
+                                    updatedAt:
+                                        FieldValue.serverTimestamp(),
+                                },
+                                { merge: true }
+                            );
+
+                            referralFirstPurchaseRewarded = true;
+
+                            const referrerNotificationRef =
+                                referrerRef
+                                    .collection("notifications")
+                                    .doc();
+
+                            transaction.set(
+                                referrerNotificationRef,
+                                {
+                                    title: "Referral Ruby Reward",
+                                    message:
+                                        `Your referred friend made their first Ruby purchase. +${REFERRAL_FIRST_PURCHASE_REFERRER_REWARD} Ruby added.`,
+                                    type: "referral",
+                                    createdAt:
+                                        FieldValue.serverTimestamp(),
+                                    read: false,
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+
             transaction.update(userRef, updateData);
 
             const notificationRef = db
@@ -914,7 +1351,9 @@ aCoinAwarded: 0,
 
             transaction.set(notificationRef, {
                 title: "Payment Successful",
-                message: `You received ${product.aCoinReward} A-Coins for purchasing ${product.name || product.description}.`,
+                message: referralFirstPurchaseRewarded
+                    ? `You received ${product.aCoinReward} A-Coins for purchasing ${product.name || product.description}, plus ${REFERRAL_FIRST_PURCHASE_FRIEND_REWARD} Ruby referral bonus.`
+                    : `You received ${product.aCoinReward} A-Coins for purchasing ${product.name || product.description}.`,
                 type: "payment",
                 createdAt: FieldValue.serverTimestamp(),
                 read: false,
@@ -927,6 +1366,14 @@ aCoinAwarded: 0,
             productId: productId,
             aCoinReward: product.aCoinReward,
             aCoinAwarded: product.aCoinReward,
+            referralFriendReward:
+                referralFirstPurchaseRewarded
+                    ? REFERRAL_FIRST_PURCHASE_FRIEND_REWARD
+                    : 0,
+            referralReferrerReward:
+                referralFirstPurchaseRewarded
+                    ? REFERRAL_FIRST_PURCHASE_REFERRER_REWARD
+                    : 0,
         });
 
     } catch (error) {
