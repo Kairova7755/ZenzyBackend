@@ -110,6 +110,16 @@ const PRODUCTS = {
         trialDays: 30, // 1 month
         description: "Yearly Zenzy Subscription",
     },
+    new_user_100_ruby: {
+        id: "new_user_100_ruby",
+        type: "pack",
+        name: "New User 100 Ruby Offer",
+        amountInPaise: 2900, // ₹29
+        amountRupees: 29,
+        aCoinReward: 100,
+        description: "100 Ruby New User Offer",
+        newUserOnly: true,
+    },
     coin_49: {
         id: "coin_49",
         type: "pack",
@@ -265,6 +275,46 @@ app.get("/", (req, res) => {
  * One-Time Coin Pack Order Creation (POST /create-order)
  * --------------------------------------------------------------------------
  */
+
+/*
+ * --------------------------------------------------------------------------
+ * New User ₹29 / 100 Ruby Offer Status
+ * GET /new-user-offer-status
+ * --------------------------------------------------------------------------
+ */
+app.get("/new-user-offer-status", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+        const userDoc = await db.collection("users").doc(uid).get();
+
+        if (!userDoc.exists) {
+            return res.status(200).json({
+                success: true,
+                eligible: false,
+                claimed: false,
+            });
+        }
+
+        const data = userDoc.data() || {};
+        const eligible =
+            data.newUserOfferEligible === true &&
+            data.newUserOfferClaimed !== true;
+
+        return res.status(200).json({
+            success: true,
+            eligible,
+            claimed: data.newUserOfferClaimed === true,
+        });
+    } catch (error) {
+        console.error("New User Offer Status Error:", error);
+        return res.status(500).json({
+            success: false,
+            eligible: false,
+            message: "Could not check new user offer status",
+        });
+    }
+});
+
 app.post("/create-order", requireFirebaseUser, async (req, res) => {
     try {
         const { productId } = req.body || {};
@@ -280,6 +330,36 @@ const product = getProduct(productId);
             return res.status(400).json({
                 error: "Subscription products must be created via /create-subscription endpoint",
             });
+        }
+
+        // The ₹29 / 100 Ruby offer is strictly one-time and server-controlled.
+        if (productId === "new_user_100_ruby") {
+            const userDoc = await db.collection("users").doc(uid).get();
+
+            if (!userDoc.exists) {
+                return res.status(404).json({
+                    success: false,
+                    error: "User profile not found",
+                });
+            }
+
+            const userData = userDoc.data() || {};
+
+            if (userData.newUserOfferEligible !== true) {
+                return res.status(403).json({
+                    success: false,
+                    error: "This new user offer is not available for this account",
+                    code: "NEW_USER_OFFER_NOT_ELIGIBLE",
+                });
+            }
+
+            if (userData.newUserOfferClaimed === true) {
+                return res.status(409).json({
+                    success: false,
+                    error: "This new user offer has already been used",
+                    code: "NEW_USER_OFFER_ALREADY_CLAIMED",
+                });
+            }
         }
 
         const options = {
@@ -722,13 +802,31 @@ aCoinAwarded: 0,
                 Number(userData.aCoins || userData.acoin || 0)
             );
 
+            // Final server-side gate. Even if multiple ₹29 orders were opened,
+            // only the first verified payment can claim the one-time offer.
+            if (productId === "new_user_100_ruby") {
+                if (userData.newUserOfferEligible !== true) {
+                    throw new Error("NEW_USER_OFFER_NOT_ELIGIBLE");
+                }
+
+                if (userData.newUserOfferClaimed === true) {
+                    throw new Error("NEW_USER_OFFER_ALREADY_CLAIMED");
+                }
+            }
+
             transaction.set(paymentRef, {
                 paymentId: razorpay_payment_id,
                 orderId: order.id,
                 uid: uid,
                 productId: productId,
+                productName: product.name,
                 amount: payment.amount,
+                amountRupees: product.amountRupees,
+                aCoinReward: product.aCoinReward,
                 status: payment.status,
+                type: productId === "new_user_100_ruby"
+                    ? "new_user_offer"
+                    : "ruby_pack",
                 createdAt: FieldValue.serverTimestamp(),
             });
 
@@ -737,6 +835,11 @@ aCoinAwarded: 0,
                 acoin: currentCoins + product.aCoinReward,
                 updatedAt: FieldValue.serverTimestamp(),
             };
+
+            if (productId === "new_user_100_ruby") {
+                updateData.newUserOfferClaimed = true;
+                updateData.newUserOfferClaimedAt = FieldValue.serverTimestamp();
+            }
 
             transaction.update(userRef, updateData);
 
@@ -770,6 +873,22 @@ aCoinAwarded: 0,
             return res.status(409).json({
                 success: false,
                 message: "Payment has already been processed",
+            });
+        }
+
+        if (error.message === "NEW_USER_OFFER_ALREADY_CLAIMED") {
+            return res.status(409).json({
+                success: false,
+                message: "This new user offer has already been used",
+                code: "NEW_USER_OFFER_ALREADY_CLAIMED",
+            });
+        }
+
+        if (error.message === "NEW_USER_OFFER_NOT_ELIGIBLE") {
+            return res.status(403).json({
+                success: false,
+                message: "This new user offer is not available for this account",
+                code: "NEW_USER_OFFER_NOT_ELIGIBLE",
             });
         }
 
