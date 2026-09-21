@@ -65,6 +65,7 @@ const db = getFirestore();
 const adminAuth = getAuth();
 
 const FIRST_TIME_OFFER_WINDOW_MS = 12 * 60 * 60 * 1000;
+const MYSTERY_BOX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /*
  * --------------------------------------------------------------------------
@@ -242,17 +243,65 @@ const PRODUCTS = {
         aCoinReward: 1200,
         description: "1200 A-Coins Pack",
     },
+    mystery_9_30: {
+        id: "mystery_9_30",
+        type: "pack",
+        name: "Mystery Box 30 Ruby",
+        amountInPaise: 900,
+        amountRupees: 9,
+        aCoinReward: 30,
+        description: "30 Ruby - 7 Day Mystery Offer",
+        mysteryBox: true,
+    },
+    mystery_19_50: {
+        id: "mystery_19_50",
+        type: "pack",
+        name: "Mystery Box 50 Ruby",
+        amountInPaise: 1900,
+        amountRupees: 19,
+        aCoinReward: 50,
+        description: "50 Ruby - 7 Day Mystery Offer",
+        mysteryBox: true,
+    },
+    mystery_49_80: {
+        id: "mystery_49_80",
+        type: "pack",
+        name: "Mystery Box 80 Ruby",
+        amountInPaise: 4900,
+        amountRupees: 49,
+        aCoinReward: 80,
+        description: "80 Ruby - 7 Day Mystery Offer",
+        mysteryBox: true,
+    },
 };
 
 PRODUCTS.monthlyPlan = PRODUCTS.monthly;
 PRODUCTS.yearlyPlan = PRODUCTS.yearly;
 
 const VIDEO_COSTS = {
-    10: 18,
-    30: 50,
-    50: 76,
-    90: 250,
+    10: { "720p": 12, "1080p": 15 },
+    30: { "720p": 32, "1080p": 40 },
+    50: { "720p": 56, "1080p": 70 },
+    90: { "720p": 450, "1080p": 510, "1440p": 650 },
 };
+
+function getVideoCost(duration, quality) {
+    const row = VIDEO_COSTS[duration];
+    if (!row) return null;
+    return Number(row[quality]) || null;
+}
+
+function getImageCost(imageCount, quality) {
+    const base = {
+        "720p": 12,
+        "1080p": 18,
+        "2K": 25,
+        "4K": 35,
+    }[quality];
+    if (!base) return null;
+    const count = Math.max(1, Math.min(4, Number(imageCount) || 1));
+    return base + (count - 1) * 5;
+}
 
 function getProduct(productId) {
     return PRODUCTS[productId] || null;
@@ -396,6 +445,47 @@ app.get("/new-user-offer-status", requireFirebaseUser, async (req, res) => {
     }
 });
 
+
+/*
+ * --------------------------------------------------------------------------
+ * Mystery Ruby Box — all users, 7-day server-controlled window
+ * GET /mystery-box-status
+ * --------------------------------------------------------------------------
+ */
+app.get("/mystery-box-status", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+        const userRef = db.collection("users").doc(uid);
+        const userDoc = await userRef.get();
+        if (!userDoc.exists) {
+            return res.status(404).json({ success: false, message: "User profile not found" });
+        }
+
+        const userData = userDoc.data() || {};
+        let startedAt = Number(userData.mysteryBoxStartedAtMs || 0);
+        if (!startedAt) {
+            startedAt = Date.now();
+            await userRef.set(
+                { mysteryBoxStartedAtMs: startedAt, mysteryBoxExpiresAtMs: startedAt + MYSTERY_BOX_WINDOW_MS },
+                { merge: true }
+            );
+        }
+
+        const expiresAt = Number(userData.mysteryBoxExpiresAtMs || (startedAt + MYSTERY_BOX_WINDOW_MS));
+        return res.json({
+            success: true,
+            startedAt,
+            expiresAt,
+            expired: Date.now() >= expiresAt,
+            claimed9: userData.mysteryBoxClaimed9 === true,
+            claimed19: userData.mysteryBoxClaimed19 === true,
+            claimed49: userData.mysteryBoxClaimed49 === true,
+        });
+    } catch (error) {
+        console.error("Mystery Box Status Error:", error);
+        return res.status(500).json({ success: false, message: "Could not load Mystery Box status" });
+    }
+});
 
 /*
  * --------------------------------------------------------------------------
@@ -689,6 +779,30 @@ const product = getProduct(productId);
                         success: false,
                         error: "This new user offer has already been used",
                         code: "NEW_USER_OFFER_ALREADY_CLAIMED",
+                    });
+                }
+            }
+
+            if (product.mysteryBox === true) {
+                const startedAt = Number(userData.mysteryBoxStartedAtMs || 0);
+                const expiresAt = Number(userData.mysteryBoxExpiresAtMs || (startedAt + MYSTERY_BOX_WINDOW_MS));
+                if (!startedAt || Date.now() >= expiresAt) {
+                    return res.status(410).json({
+                        success: false,
+                        error: "This 7-day Mystery Ruby offer has expired",
+                        code: "MYSTERY_BOX_EXPIRED",
+                    });
+                }
+                const claimedField = productId === "mystery_9_30"
+                    ? "mysteryBoxClaimed9"
+                    : productId === "mystery_19_50"
+                        ? "mysteryBoxClaimed19"
+                        : "mysteryBoxClaimed49";
+                if (userData[claimedField] === true) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "This Mystery Ruby offer has already been used",
+                        code: "MYSTERY_BOX_ALREADY_CLAIMED",
                     });
                 }
             }
@@ -1186,6 +1300,22 @@ aCoinAwarded: 0,
                 }
             }
 
+            if (product.mysteryBox === true) {
+                const startedAt = Number(userData.mysteryBoxStartedAtMs || 0);
+                const expiresAt = Number(userData.mysteryBoxExpiresAtMs || (startedAt + MYSTERY_BOX_WINDOW_MS));
+                if (!startedAt || Date.now() >= expiresAt) {
+                    throw new Error("MYSTERY_BOX_EXPIRED");
+                }
+                const claimedField = productId === "mystery_9_30"
+                    ? "mysteryBoxClaimed9"
+                    : productId === "mystery_19_50"
+                        ? "mysteryBoxClaimed19"
+                        : "mysteryBoxClaimed49";
+                if (userData[claimedField] === true) {
+                    throw new Error("MYSTERY_BOX_ALREADY_CLAIMED");
+                }
+            }
+
             transaction.set(paymentRef, {
                 paymentId: razorpay_payment_id,
                 orderId: order.id,
@@ -1218,6 +1348,19 @@ aCoinAwarded: 0,
             if (productId === "first_time_20_ruby") {
                 updateData.firstTimeOfferClaimed = true;
                 updateData.firstTimeOfferClaimedAt = FieldValue.serverTimestamp();
+            }
+
+            if (product.mysteryBox === true) {
+                if (productId === "mystery_9_30") {
+                    updateData.mysteryBoxClaimed9 = true;
+                    updateData.mysteryBoxClaimed9At = FieldValue.serverTimestamp();
+                } else if (productId === "mystery_19_50") {
+                    updateData.mysteryBoxClaimed19 = true;
+                    updateData.mysteryBoxClaimed19At = FieldValue.serverTimestamp();
+                } else if (productId === "mystery_49_80") {
+                    updateData.mysteryBoxClaimed49 = true;
+                    updateData.mysteryBoxClaimed49At = FieldValue.serverTimestamp();
+                }
             }
 
             /*
@@ -1383,6 +1526,22 @@ aCoinAwarded: 0,
             return res.status(409).json({
                 success: false,
                 message: "Payment has already been processed",
+            });
+        }
+
+        if (error.message === "MYSTERY_BOX_ALREADY_CLAIMED") {
+            return res.status(409).json({
+                success: false,
+                message: "This Mystery Ruby offer has already been used",
+                code: "MYSTERY_BOX_ALREADY_CLAIMED",
+            });
+        }
+
+        if (error.message === "MYSTERY_BOX_EXPIRED") {
+            return res.status(410).json({
+                success: false,
+                message: "This 7-day Mystery Ruby offer has expired",
+                code: "MYSTERY_BOX_EXPIRED",
             });
         }
 
@@ -2067,19 +2226,52 @@ app.post(
                 videoDurationSeconds,
                 aCoinCost,
                 quality,
+                aspectRatio,
+                videoStyle,
+                imageStyle,
                 createdAt,
                 requestDate,
             } = body;
 
-            const duration = Number(videoDurationSeconds);
-            const expectedCost = VIDEO_COSTS[duration];
+            const duration = Number(videoDurationSeconds || 0);
+            const requestedMode = typeof generationMode === "string"
+                ? generationMode.toUpperCase()
+                : "IMAGE";
 
-            // Validate duration and server-side price
-            if (!expectedCost) {
-                return res.status(400).json({
-                    success: false,
-                    message: "Invalid video duration selected",
-                });
+            const normalizedQuality = typeof quality === "string" ? quality.trim() : "1080p";
+            const urlsForPricing = Array.isArray(photoUrls)
+                ? photoUrls.filter((url) => typeof url === "string" && url.trim().length > 0)
+                : [];
+
+            let expectedCost = null;
+            if (requestedMode === "CHARACTER") {
+                if (urlsForPricing.length < 1 || urlsForPricing.length > 4) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Create Image supports 1 to 4 images",
+                    });
+                }
+                expectedCost = getImageCost(urlsForPricing.length, normalizedQuality);
+                if (!expectedCost) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid image quality selected",
+                    });
+                }
+            } else {
+                expectedCost = getVideoCost(duration, normalizedQuality);
+                if (!expectedCost) {
+                    return res.status(400).json({
+                        success: false,
+                        message: "Invalid video duration or quality selected",
+                    });
+                }
+                if (duration !== 90 && normalizedQuality === "1440p") {
+                    return res.status(400).json({
+                        success: false,
+                        message: "1440p is available only for 90-second videos",
+                    });
+                }
             }
 
             if (Number(aCoinCost) !== expectedCost) {
@@ -2098,21 +2290,23 @@ app.post(
                   )
                 : [];
 
-            const mode =
-    typeof generationMode === "string" &&
-    generationMode.toUpperCase() === "TEXT"
-        ? "TEXT"
-        : "IMAGE";
+            const mode = requestedMode === "TEXT"
+                ? "TEXT"
+                : requestedMode === "CHARACTER"
+                    ? "CHARACTER"
+                    : "IMAGE";
 
-if (
-    mode === "IMAGE" &&
-    (urls.length < 1 || urls.length > 5)
-) {
-    return res.status(400).json({
-        success: false,
-        message: "Please provide 1 to 5 uploaded photos",
-    });
-}
+            if (
+                (mode === "IMAGE" && (urls.length < 1 || urls.length > 5)) ||
+                (mode === "CHARACTER" && (urls.length < 1 || urls.length > 4))
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: mode === "CHARACTER"
+                        ? "Please provide 1 to 4 images for Create Image"
+                        : "Please provide 1 to 5 uploaded photos",
+                });
+            }
 
 if (
     mode === "TEXT" &&
@@ -2233,14 +2427,13 @@ if (
                         aCoinCost:
                             expectedCost,
 
-                        quality:
-                            typeof quality === "string"
-                                ? quality
-                                : (
-                                      duration === 90
-                                          ? "Ultra Full HD"
-                                          : "Full HD"
-                                  ),
+                        quality: normalizedQuality,
+                        aspectRatio:
+                            typeof aspectRatio === "string" ? aspectRatio : "9:16",
+                        videoStyle:
+                            typeof videoStyle === "string" ? videoStyle : "Auto",
+                        imageStyle:
+                            typeof imageStyle === "string" ? imageStyle : "Realistic",
 
                         status: "Pending",
 
