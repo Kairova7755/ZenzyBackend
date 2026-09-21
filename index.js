@@ -220,7 +220,7 @@ const PRODUCTS = {
         id: "coin_199",
         type: "pack",
         name: "Popular A-Coin",
-        amountInPaise: 2100, // ₹210
+        amountInPaise: 21000, // ₹210
         amountRupees: 210,
         aCoinReward: 200,
         description: "200 A-Coins Pack",
@@ -2521,7 +2521,15 @@ if (
  * Change only these values when releasing a newer APK.
  */
 app.get("/app-version", (req, res) => {
-    const latestVersionCode = Number(process.env.ZENZY_LATEST_VERSION_CODE || 2);
+    // FUTURE RELEASES:
+    // Only change these Render environment variables:
+    // ZENZY_LATEST_VERSION_CODE = new Android versionCode
+    // ZENZY_MINIMUM_VERSION_CODE = same value for a mandatory update
+    // ZENZY_LATEST_VERSION_NAME = e.g. 1.2
+    // ZENZY_APK_DOWNLOAD_URL = direct HTTPS URL of the new APK
+    const latestVersionCode = Number(
+        process.env.ZENZY_LATEST_VERSION_CODE || 2
+    );
     const minimumVersionCode = Number(
         process.env.ZENZY_MINIMUM_VERSION_CODE || latestVersionCode
     );
@@ -2531,8 +2539,11 @@ app.get("/app-version", (req, res) => {
         process.env.ZENZY_APK_DOWNLOAD_URL ||
         "https://github.com/Kairova7755/zenzy-website/releases/latest/download/ZenzyFlow.apk";
 
+    const forceUpdate = minimumVersionCode > 0;
+
     return res.status(200).json({
         success: true,
+        forceUpdate,
         latestVersionCode,
         minimumVersionCode,
         latestVersionName,
