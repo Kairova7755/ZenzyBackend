@@ -2318,6 +2318,38 @@ if (
     }
 );
 
+
+/*
+ * --------------------------------------------------------------------------
+ * Zenzy App Forced Update
+ * GET /app-version
+ * --------------------------------------------------------------------------
+ * The Android app checks this endpoint before opening the main app.
+ * Change only these values when releasing a newer APK.
+ */
+app.get("/app-version", (req, res) => {
+    const latestVersionCode = Number(process.env.ZENZY_LATEST_VERSION_CODE || 2);
+    const minimumVersionCode = Number(
+        process.env.ZENZY_MINIMUM_VERSION_CODE || latestVersionCode
+    );
+    const latestVersionName =
+        process.env.ZENZY_LATEST_VERSION_NAME || "1.1";
+    const downloadUrl =
+        process.env.ZENZY_APK_DOWNLOAD_URL ||
+        "https://github.com/Kairova7755/zenzy-website/releases/latest/download/ZenzyFlow.apk";
+
+    return res.status(200).json({
+        success: true,
+        latestVersionCode,
+        minimumVersionCode,
+        latestVersionName,
+        downloadUrl,
+        releaseNotes:
+            process.env.ZENZY_RELEASE_NOTES ||
+            "New Zenzy Flow update is available.",
+    });
+});
+
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
