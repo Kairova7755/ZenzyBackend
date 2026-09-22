@@ -21,6 +21,10 @@ const {
     FieldValue,
 } = require("firebase-admin/firestore");
 
+const {
+    getMessaging,
+} = require("firebase-admin/messaging");
+
 const app = express();
 
 app.use(cors());
@@ -387,6 +391,297 @@ async function requireFirebaseUser(req, res, next) {
 }
 
 /*
+ * --------------------------------------------------------------------------
+ * Zenzy Direct Chat — Firebase Cloud Messaging (FCM)
+ * --------------------------------------------------------------------------
+ * These endpoints are used by the Android app for Instagram/Messenger-style
+ * push notifications.
+ *
+ * - POST /register-fcm-token
+ *     Saves the authenticated user's FCM token in users/{uid}.
+ *
+ * - POST /send-direct-message-notification
+ *     Sends a push notification to the recipient after a direct-chat message
+ *     is written to Firestore by the Android app.
+ *
+ * Invalid/expired FCM tokens are automatically removed.
+ * The existing Razorpay, referral, subscription, video-request and update
+ * systems are not changed by this section.
+ * --------------------------------------------------------------------------
+ */
+
+function cleanFcmToken(value) {
+    return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeFcmTokens(value) {
+    if (!Array.isArray(value)) return [];
+
+    return [...new Set(
+        value
+            .map(cleanFcmToken)
+            .filter(Boolean)
+    )].slice(0, 50);
+}
+
+async function getUserFcmTokens(uid) {
+    if (!uid) return [];
+
+    const userDoc = await db.collection("users").doc(uid).get();
+    if (!userDoc.exists) return [];
+
+    const data = userDoc.data() || {};
+    return normalizeFcmTokens(data.fcmTokens);
+}
+
+async function removeFcmTokens(uid, tokensToRemove) {
+    const removeSet = new Set(normalizeFcmTokens(tokensToRemove));
+    if (!uid || removeSet.size === 0) return;
+
+    const userRef = db.collection("users").doc(uid);
+    const userDoc = await userRef.get();
+    if (!userDoc.exists) return;
+
+    const data = userDoc.data() || {};
+    const currentTokens = normalizeFcmTokens(data.fcmTokens);
+    const remainingTokens = currentTokens.filter(
+        (token) => !removeSet.has(token)
+    );
+
+    await userRef.set(
+        {
+            fcmTokens: remainingTokens,
+            updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+    );
+}
+
+app.post("/register-fcm-token", requireFirebaseUser, async (req, res) => {
+    try {
+        const uid = req.uid;
+        const token = cleanFcmToken(req.body?.token);
+
+        if (!token) {
+            return res.status(400).json({
+                success: false,
+                message: "FCM token is required",
+            });
+        }
+
+        const userRef = db.collection("users").doc(uid);
+        const userDoc = await userRef.get();
+
+        if (!userDoc.exists) {
+            return res.status(404).json({
+                success: false,
+                message: "Zenzy user account not found",
+            });
+        }
+
+        const data = userDoc.data() || {};
+        const currentTokens = normalizeFcmTokens(data.fcmTokens);
+
+        // Keep the newest token once, with a small safety cap for multi-device use.
+        const nextTokens = [
+            token,
+            ...currentTokens.filter((item) => item !== token),
+        ].slice(0, 50);
+
+        await userRef.set(
+            {
+                fcmTokens: nextTokens,
+                fcmTokenUpdatedAt: FieldValue.serverTimestamp(),
+                updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true }
+        );
+
+        return res.status(200).json({
+            success: true,
+            message: "FCM token registered",
+        });
+    } catch (error) {
+        console.error("REGISTER FCM TOKEN ERROR:", error);
+
+        return res.status(500).json({
+            success: false,
+            message: "Could not register FCM token",
+        });
+    }
+});
+
+app.post(
+    "/send-direct-message-notification",
+    requireFirebaseUser,
+    async (req, res) => {
+        try {
+            const senderUid = req.uid;
+            const {
+                receiverUid,
+                senderName,
+                messageType,
+                messageText,
+                conversationId,
+            } = req.body || {};
+
+            if (
+                !receiverUid ||
+                typeof receiverUid !== "string" ||
+                receiverUid.trim() === ""
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Receiver UID is required",
+                });
+            }
+
+            if (receiverUid === senderUid) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Cannot send a chat notification to yourself",
+                });
+            }
+
+            // Verify the receiver exists before attempting FCM delivery.
+            const receiverRef = db.collection("users").doc(receiverUid.trim());
+            const receiverDoc = await receiverRef.get();
+
+            if (!receiverDoc.exists) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Receiver account not found",
+                });
+            }
+
+            const receiverData = receiverDoc.data() || {};
+            const tokens = normalizeFcmTokens(receiverData.fcmTokens);
+
+            if (tokens.length === 0) {
+                return res.status(200).json({
+                    success: true,
+                    sent: 0,
+                    message: "Receiver has no registered notification token",
+                });
+            }
+
+            const cleanSenderName =
+                typeof senderName === "string" && senderName.trim()
+                    ? senderName.trim().slice(0, 80)
+                    : "Zenzy User";
+
+            const cleanType =
+                typeof messageType === "string" && messageType.trim()
+                    ? messageType.trim().slice(0, 30)
+                    : "text";
+
+            const rawText =
+                typeof messageText === "string"
+                    ? messageText.trim()
+                    : "";
+
+            let notificationBody = rawText;
+
+            if (cleanType === "image") {
+                notificationBody = "📷 Photo";
+            } else if (cleanType === "file") {
+                notificationBody = "📎 File";
+            } else if (!notificationBody) {
+                notificationBody = "New message";
+            }
+
+            notificationBody = notificationBody.slice(0, 180);
+
+            const invalidTokens = [];
+            let successCount = 0;
+            let failureCount = 0;
+
+            // Send individually for broad firebase-admin compatibility.
+            for (const token of tokens) {
+                try {
+                    await getMessaging().send({
+                        token,
+                        notification: {
+                            title: cleanSenderName,
+                            body: notificationBody,
+                        },
+                        data: {
+                            type: "direct_chat",
+                            conversationId:
+                                typeof conversationId === "string"
+                                    ? conversationId.slice(0, 200)
+                                    : "",
+                            senderUid: senderUid,
+                            receiverUid: receiverUid.trim(),
+                            messageType: cleanType,
+                        },
+                        android: {
+                            priority: "high",
+                            notification: {
+                                channelId: "zenzy_chat",
+                                sound: "default",
+                            },
+                        },
+                    });
+
+                    successCount += 1;
+                } catch (sendError) {
+                    failureCount += 1;
+
+                    const code = String(
+                        sendError?.code || ""
+                    ).toLowerCase();
+
+                    if (
+                        code.includes("registration-token-not-registered") ||
+                        code.includes("invalid-registration-token") ||
+                        code.includes("invalid-argument")
+                    ) {
+                        invalidTokens.push(token);
+                    }
+
+                    console.error(
+                        "FCM DIRECT CHAT SEND ERROR:",
+                        sendError?.message || sendError
+                    );
+                }
+            }
+
+            if (invalidTokens.length > 0) {
+                try {
+                    await removeFcmTokens(
+                        receiverUid.trim(),
+                        invalidTokens
+                    );
+                } catch (cleanupError) {
+                    console.error(
+                        "FCM INVALID TOKEN CLEANUP ERROR:",
+                        cleanupError?.message || cleanupError
+                    );
+                }
+            }
+
+            return res.status(200).json({
+                success: true,
+                sent: successCount,
+                failed: failureCount,
+                removedInvalidTokens: invalidTokens.length,
+            });
+        } catch (error) {
+            console.error(
+                "SEND DIRECT MESSAGE NOTIFICATION ERROR:",
+                error
+            );
+
+            return res.status(500).json({
+                success: false,
+                message: "Could not send direct chat notification",
+            });
+        }
+    }
+);
+
+ /*
  * --------------------------------------------------------------------------
  * Health Check & API Routes
  * --------------------------------------------------------------------------
@@ -2528,7 +2823,7 @@ app.get("/app-version", (req, res) => {
     // ZENZY_LATEST_VERSION_NAME = e.g. 1.2
     // ZENZY_APK_DOWNLOAD_URL = direct HTTPS URL of the new APK
     const latestVersionCode = Number(
-        process.env.ZENZY_LATEST_VERSION_CODE || 3;
+        process.env.ZENZY_LATEST_VERSION_CODE || 3
     );
     const minimumVersionCode = Number(
         process.env.ZENZY_MINIMUM_VERSION_CODE || latestVersionCode
