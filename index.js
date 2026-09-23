@@ -2855,10 +2855,10 @@ app.get("/app-version", (req, res) => {
     // ZENZY_LATEST_VERSION_NAME = e.g. 1.2
     // ZENZY_APK_DOWNLOAD_URL = direct HTTPS URL of the new APK
     const latestVersionCode = Number(
-        process.env.ZENZY_LATEST_VERSION_CODE || 5,
+        process.env.ZENZY_LATEST_VERSION_CODE || 5
     );
     const minimumVersionCode = Number(
-        process.env.ZENZY_MINIMUM_VERSION_CODE || 5,
+        process.env.ZENZY_MINIMUM_VERSION_CODE || 5
     );
     const latestVersionName =
         process.env.ZENZY_LATEST_VERSION_NAME || "1.4";
@@ -2877,7 +2877,7 @@ app.get("/app-version", (req, res) => {
         downloadUrl,
         releaseNotes:
             process.env.ZENZY_RELEASE_NOTES ||
-            "New Zenzy Flow update is available.",
+            "Nova Flow v1.4 is available. Includes improved chat video audio playback.",
     });
 });
 
