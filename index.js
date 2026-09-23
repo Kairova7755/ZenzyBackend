@@ -543,6 +543,38 @@ app.post(
                 });
             }
 
+            // The sender may notify only the other participant of the exact
+            // direct-chat conversation that contains both authenticated UIDs.
+            if (typeof conversationId !== "string" || !conversationId.trim()) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Conversation ID is required",
+                });
+            }
+
+            const conversationRef = db.collection("directChats").doc(conversationId.trim());
+            const conversationDoc = await conversationRef.get();
+            if (!conversationDoc.exists) {
+                return res.status(404).json({
+                    success: false,
+                    message: "Direct chat conversation not found",
+                });
+            }
+
+            const conversationData = conversationDoc.data() || {};
+            const participantA = String(conversationData.userA || "");
+            const participantB = String(conversationData.userB || "");
+            const participantsMatch =
+                (participantA === senderUid && participantB === receiverUid.trim()) ||
+                (participantB === senderUid && participantA === receiverUid.trim());
+
+            if (!participantsMatch) {
+                return res.status(403).json({
+                    success: false,
+                    message: "You are not authorized to notify this conversation",
+                });
+            }
+
             // Verify the receiver exists before attempting FCM delivery.
             const receiverRef = db.collection("users").doc(receiverUid.trim());
             const receiverDoc = await receiverRef.get();
@@ -2823,18 +2855,18 @@ app.get("/app-version", (req, res) => {
     // ZENZY_LATEST_VERSION_NAME = e.g. 1.2
     // ZENZY_APK_DOWNLOAD_URL = direct HTTPS URL of the new APK
     const latestVersionCode = Number(
-        process.env.ZENZY_LATEST_VERSION_CODE || 3
+        process.env.ZENZY_LATEST_VERSION_CODE || 4
     );
     const minimumVersionCode = Number(
         process.env.ZENZY_MINIMUM_VERSION_CODE || latestVersionCode
     );
     const latestVersionName =
-        process.env.ZENZY_LATEST_VERSION_NAME || "1.2";
+        process.env.ZENZY_LATEST_VERSION_NAME || "1.3";
     const downloadUrl =
         process.env.ZENZY_APK_DOWNLOAD_URL ||
         "https://github.com/Kairova7755/zenzy-website/releases/latest/download/ZenzyFlow.apk";
 
-    const forceUpdate = minimumVersionCode > 3;
+    const forceUpdate = minimumVersionCode >= latestVersionCode;
 
     return res.status(200).json({
         success: true,
