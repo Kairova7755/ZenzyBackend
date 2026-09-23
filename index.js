@@ -2855,13 +2855,13 @@ app.get("/app-version", (req, res) => {
     // ZENZY_LATEST_VERSION_NAME = e.g. 1.2
     // ZENZY_APK_DOWNLOAD_URL = direct HTTPS URL of the new APK
     const latestVersionCode = Number(
-        process.env.ZENZY_LATEST_VERSION_CODE || 4
+        process.env.ZENZY_LATEST_VERSION_CODE || 5,
     );
     const minimumVersionCode = Number(
-        process.env.ZENZY_MINIMUM_VERSION_CODE || latestVersionCode
+        process.env.ZENZY_MINIMUM_VERSION_CODE || 5,
     );
     const latestVersionName =
-        process.env.ZENZY_LATEST_VERSION_NAME || "1.3";
+        process.env.ZENZY_LATEST_VERSION_NAME || "1.4";
     const downloadUrl =
         process.env.ZENZY_APK_DOWNLOAD_URL ||
         "https://github.com/Kairova7755/zenzy-website/releases/latest/download/ZenzyFlow.apk";
