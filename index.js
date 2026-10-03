@@ -2464,6 +2464,25 @@ if (actualChargedAmount !== expectedRenewalAmount) {
                 updatedAt: FieldValue.serverTimestamp(),
             };
 
+            // A failed renewal payment must NOT immediately remove Premium.
+            // Razorpay handles its own retry/dunning lifecycle. Premium is
+            // removed only when the subscription reaches a terminal state
+            // such as cancelled, completed, or expired.
+            if (eventName === "payment.failed") {
+                update.paymentFailed = true;
+                update.lastPaymentFailedAt = FieldValue.serverTimestamp();
+                update.lastPaymentFailedId = paymentEntity?.id || null;
+
+                await subscriptionRef.set(update, { merge: true });
+
+                return res.json({
+                    success: true,
+                    processed: true,
+                    event: eventName,
+                    premiumPreserved: true,
+                });
+            }
+
             if (
     eventName === "subscription.cancelled" ||
     eventName === "subscription.completed" ||
