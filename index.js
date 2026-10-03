@@ -1229,8 +1229,11 @@ app.post("/create-subscription", requireFirebaseUser, async (req, res) => {
 
         const startAt = getSubscriptionStartAt(product);
 
+        // Give the Razorpay subscription authorization window 30 days
+        // instead of the previous 7-day expiry.
+        // This does not change Razorpay’s recurring-payment retry policy.
         const expireBy =
-            Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60;
+            Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
 
         const subscriptionOptions = {
             plan_id: planId,
@@ -2886,4 +2889,3 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
 });
-
