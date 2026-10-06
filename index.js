@@ -178,7 +178,7 @@ const PRODUCTS = {
         aCoinReward: 2800,
         renewalAmountRupees: 2100,
         renewalPrice: 2100,
-        trialDays: 30, // 1 month
+        trialDays: 2,
         description: "Yearly Zenzy Subscription",
     },
     new_user_100_ruby: {
@@ -1425,21 +1425,27 @@ const currentCoins = Math.max(
     Number(userData.aCoins || userData.acoin || 0)
 );
 
+// Initial Premium reward:
+// Yearly -> 2800 Ruby immediately.
+// Monthly -> no Ruby at initial ₹1 authorization.
+const initialReward =
+    productId === "yearly" ? product.aCoinReward : 0;
+
                 transaction.set(paymentRef, {
                     paymentId: razorpay_payment_id,
                     subscriptionId: razorpay_subscription_id,
                     uid: uid,
                     productId: productId,
                    amount: product.amountInPaise,
-aCoinReward: 0,
+aCoinReward: initialReward,
 type: "subscription_initial",
 status: "captured",
                     createdAt: FieldValue.serverTimestamp(),
                 });
 
                 transaction.update(userRef, {
-                    aCoins: currentCoins,
-                    acoin: currentCoins,
+                    aCoins: currentCoins + initialReward,
+                    acoin: currentCoins + initialReward,
                     isPremium: true,
                     plan: productId === "monthly" ? "MONTHLY" : "YEARLY",
                     subscriptionType: productId,
@@ -1477,7 +1483,9 @@ status: "captured",
 
                 transaction.set(notificationRef, {
                     title: "Premium Activated",
-                   message: `Welcome to Zenzy Premium! Your ${product.name} trial has started. A-Coins will be credited only after the first successful renewal payment of ₹${product.renewalAmountRupees}.`,
+                   message: productId === "yearly"
+                        ? `Welcome to Zenzy Premium! Your ${product.name} 2-day trial has started. ${initialReward} Ruby has been credited immediately. ₹${product.renewalAmountRupees} will be charged after the trial, and ${product.aCoinReward} Ruby will be credited on each successful renewal.`
+                        : `Welcome to Zenzy Premium! Your ${product.name} trial has started. 650 Ruby will be credited after the first successful renewal payment of ₹${product.renewalAmountRupees}.`,
                     type: "payment",
                     createdAt: FieldValue.serverTimestamp(),
                     read: false,
@@ -1489,8 +1497,8 @@ status: "captured",
                 message: "Subscription verified successfully",
                 subscriptionId: razorpay_subscription_id,
                 productId: productId,
-              aCoinReward: 0,
-aCoinAwarded: 0,
+              aCoinReward: productId === "yearly" ? product.aCoinReward : 0,
+              aCoinAwarded: productId === "yearly" ? product.aCoinReward : 0,
             });
         }
 
