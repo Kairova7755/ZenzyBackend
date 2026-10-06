@@ -75,19 +75,19 @@ const MYSTERY_BOX_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
  * --------------------------------------------------------------------------
  * Referral / Invite & Earn
  * --------------------------------------------------------------------------
- * Signup reward:
- *   Referred friend signs up through a valid invite -> referrer +50 Ruby.
+ * Referral reward per successful friend:
+ *   Signup -> referrer +20 Ruby.
+ *   First successful Ruby-pack purchase -> referrer +30 Ruby.
+ *   First successful Ruby-pack purchase -> referred friend +20 Ruby.
+ *   Maximum referrer reward per friend = 50 Ruby.
  *
- * First Ruby purchase reward:
- *   Referred friend completes their first successful Ruby-pack payment
- *   (any Ruby pack/offer amount, including the ₹1 first-time offer) ->
- *   referrer +100 Ruby and referred friend +30 Ruby.
- *
+ * Any successful Ruby pack/offer counts, including the ₹1 first-time offer
+ * and ₹29 new-user offer. Premium subscriptions are never included.
  * All referral rewards are server-side and transaction protected.
  */
-const REFERRAL_SIGNUP_REWARD = 50;
-const REFERRAL_FIRST_PURCHASE_REFERRER_REWARD = 100;
-const REFERRAL_FIRST_PURCHASE_FRIEND_REWARD = 30;
+const REFERRAL_SIGNUP_REWARD = 20;
+const REFERRAL_FIRST_PURCHASE_REFERRER_REWARD = 30;
+const REFERRAL_FIRST_PURCHASE_FRIEND_REWARD = 20;
 
 function makeReferralCode(uid) {
     const clean = String(uid || "")
@@ -881,7 +881,7 @@ app.get("/referral-status", requireFirebaseUser, async (req, res) => {
  * Attach Invite / Referral Code (POST /referral-attach)
  * --------------------------------------------------------------------------
  * Called after a newly created account opens a shared Zenzy invite.
- * The +50 Ruby signup reward is credited here, exactly once.
+ * The +20 Ruby signup reward is credited here, exactly once.
  * --------------------------------------------------------------------------
  */
 app.post("/referral-attach", requireFirebaseUser, async (req, res) => {
@@ -1756,18 +1756,25 @@ status: "captured",
                             updateData.referralFirstPurchaseRewardedAt =
                                 FieldValue.serverTimestamp();
 
+                            const existingReferrerRewardTotal = Math.max(
+                                0,
+                                Number(referralData.referrerRewardTotal || 0)
+                            );
+                            const remainingReferrerReward = Math.max(
+                                0,
+                                50 - existingReferrerRewardTotal
+                            );
+                            const referrerRewardToAdd = Math.min(
+                                REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                remainingReferrerReward
+                            );
+
                             transaction.update(referrerRef, {
-                                aCoins:
-                                    referrerCoins +
-                                    REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
-                                acoin:
-                                    referrerCoins +
-                                    REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                aCoins: referrerCoins + referrerRewardToAdd,
+                                acoin: referrerCoins + referrerRewardToAdd,
                                 referralRubyEarned:
-                                    Number(
-                                        referrerData.referralRubyEarned || 0
-                                    ) +
-                                    REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                    Number(referrerData.referralRubyEarned || 0) +
+                                    referrerRewardToAdd,
                                 updatedAt: FieldValue.serverTimestamp(),
                             });
 
@@ -1781,11 +1788,8 @@ status: "captured",
                                     firstPurchaseRewardedAt:
                                         FieldValue.serverTimestamp(),
                                     referrerRewardTotal:
-                                        Number(
-                                            referralData.referrerRewardTotal ||
-                                            0
-                                        ) +
-                                        REFERRAL_FIRST_PURCHASE_REFERRER_REWARD,
+                                        existingReferrerRewardTotal +
+                                        referrerRewardToAdd,
                                     friendRewardTotal:
                                         Number(
                                             referralData.friendRewardTotal ||
@@ -1810,7 +1814,7 @@ status: "captured",
                                 {
                                     title: "Referral Ruby Reward",
                                     message:
-                                        `Your referred friend made their first Ruby purchase. +${REFERRAL_FIRST_PURCHASE_REFERRER_REWARD} Ruby added.`,
+                                        `Your referred friend made their first Ruby purchase. +${referrerRewardToAdd} Ruby added.`,
                                     type: "referral",
                                     createdAt:
                                         FieldValue.serverTimestamp(),
