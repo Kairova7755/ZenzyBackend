@@ -220,6 +220,33 @@ const PRODUCTS = {
         aCoinReward: 80,
         description: "80 A-Coins Pack",
     },
+    ruby_offer_29_51: {
+        id: "ruby_offer_29_51",
+        type: "pack",
+        name: "51 Ruby Pink Diamond Offer",
+        amountInPaise: 2900, // ₹29
+        amountRupees: 29,
+        aCoinReward: 51,
+        description: "51 Ruby Pink Diamond Pack",
+    },
+    ruby_offer_49_81: {
+        id: "ruby_offer_49_81",
+        type: "pack",
+        name: "81 Ruby Offer",
+        amountInPaise: 4900, // ₹49
+        amountRupees: 49,
+        aCoinReward: 81,
+        description: "81 Ruby Pack",
+    },
+    ruby_offer_99_120: {
+        id: "ruby_offer_99_120",
+        type: "pack",
+        name: "120 Ruby Offer",
+        amountInPaise: 9900, // ₹99
+        amountRupees: 99,
+        aCoinReward: 120,
+        description: "120 Ruby Pack",
+    },
     coin_199: {
         id: "coin_199",
         type: "pack",
