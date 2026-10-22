@@ -2129,12 +2129,12 @@ app.get("/my-subscriptions", requireFirebaseUser, async (req, res) => {
                     data.recoveryPeriodStartedAt?.toMillis?.() || null,
                 recoveryPeriodEndsAtMillis:
                     data.recoveryPeriodEndsAt?.toMillis?.() || null,
-                premiumAccessRevoked:
-                    data.premiumAccessRevoked === true,
-                recoveryPeriodExpired:
-                    data.recoveryPeriodExpired === true,
                 paymentFailed:
                     data.paymentFailed === true,
+                paymentRecoveryRequired:
+                    data.paymentRecoveryRequired === true,
+                premiumAccessRevoked:
+                    data.premiumAccessRevoked === true,
                 paidCount:
                     data.paidCount ?? null,
                 remainingCount:
@@ -2453,7 +2453,32 @@ if (actualChargedAmount !== expectedRenewalAmount) {
                 await db.runTransaction(async (transaction) => {
                     const paymentSnapshot = await transaction.get(paymentRef);
                     if (paymentSnapshot.exists) {
-                        return; // Idempotent check: Payment already recorded
+                        // Idempotent replay: never award coins twice, but always restore
+                        // Premium if the successful-payment webhook is retried.
+                        transaction.set(userRef, {
+                            isPremium: true,
+                            plan: productId === "monthly" ? "MONTHLY" : "YEARLY",
+                            subscriptionStatus: "active",
+                            updatedAt: FieldValue.serverTimestamp(),
+                        }, { merge: true });
+                        transaction.set(subscriptionRef, {
+                            status: subscriptionEntity.status || "active",
+                            gracePeriodActive: false,
+                            gracePeriodStartedAt: null,
+                            gracePeriodEndsAt: null,
+                            recoveryPeriodActive: false,
+                            recoveryPeriodStartedAt: null,
+                            recoveryPeriodEndsAt: null,
+                            recoveryPeriodEndedAt: null,
+                            recoveryPeriodExpired: false,
+                            paymentFailed: false,
+                            paymentRecoveryRequired: false,
+                            premiumAccessRevoked: false,
+                            lastSuccessfulPaymentAt: FieldValue.serverTimestamp(),
+                            lastPaymentId: paymentId,
+                            updatedAt: FieldValue.serverTimestamp(),
+                        }, { merge: true });
+                        return;
                     }
 
                     const userSnapshot = await transaction.get(userRef);
@@ -2517,6 +2542,7 @@ if (actualChargedAmount !== expectedRenewalAmount) {
                             recoveryPeriodEndedAt: null,
                             recoveryPeriodExpired: false,
                             paymentFailed: false,
+                            paymentRecoveryRequired: false,
                             premiumAccessRevoked: false,
                             lastSuccessfulPaymentAt: FieldValue.serverTimestamp(),
                             paidCount: subscriptionEntity.paid_count ?? null,
@@ -2547,90 +2573,88 @@ if (actualChargedAmount !== expectedRenewalAmount) {
                 updatedAt: FieldValue.serverTimestamp(),
             };
 
-            // Policy: 60 days of Premium grace, then 0 recovery days.
-            // Never restart an already-ended grace period from repeated failure webhooks.
+            // Premium is granted only after a qualifying successful payment.
+            // A failed payment must not grant grace access. Razorpay may still
+            // move the provider subscription to pending/halted according to its
+            // own retry rules; this backend records that recovery is required.
             if (eventName === "payment.failed") {
-                const nowMillis = Date.now();
-                const existingGraceStart = existingData.gracePeriodStartedAt?.toMillis?.() || 0;
-                const existingGraceEnd = existingData.gracePeriodEndsAt?.toMillis?.() || 0;
-                const graceStillOpen = existingData.gracePeriodActive === true && existingGraceEnd > nowMillis;
-
                 update.paymentFailed = true;
                 update.lastPaymentFailedAt = FieldValue.serverTimestamp();
                 update.lastPaymentFailedId = paymentEntity?.id || null;
-
-                if (
-                    existingData.premiumAccessRevoked === true ||
-                    existingData.recoveryPeriodExpired === true ||
-                    (existingGraceEnd > 0 && existingGraceEnd <= nowMillis)
-                ) {
-                    update.gracePeriodActive = false;
-                    update.recoveryPeriodActive = false;
-                    update.recoveryPeriodStartedAt = null;
-                    update.recoveryPeriodEndsAt = null;
-                    update.premiumAccessRevoked = true;
-                    await subscriptionRef.set(update, { merge: true });
-                    return res.json({ success: true, processed: true, event: eventName, premiumPreserved: false, recoveryPeriodDays: 0, reason: "GRACE_PERIOD_ENDED" });
-                }
-
-                const graceStartMillis = graceStillOpen && existingGraceStart ? existingGraceStart : nowMillis;
-                const graceEndMillis = graceStillOpen && existingGraceEnd
-                    ? existingGraceEnd
-                    : graceStartMillis + 60 * 24 * 60 * 60 * 1000;
-                update.gracePeriodActive = true;
-                update.gracePeriodStartedAt = Timestamp.fromMillis(graceStartMillis);
-                update.gracePeriodEndsAt = Timestamp.fromMillis(graceEndMillis);
+                update.gracePeriodActive = false;
+                update.gracePeriodStartedAt = null;
+                update.gracePeriodEndsAt = null;
                 update.recoveryPeriodActive = false;
                 update.recoveryPeriodStartedAt = null;
                 update.recoveryPeriodEndsAt = null;
-                update.recoveryPeriodExpired = false;
-                update.premiumAccessRevoked = false;
+                update.paymentRecoveryRequired = true;
+                update.premiumAccessRevoked = true;
                 await subscriptionRef.set(update, { merge: true });
-                await userRef.set({ isPremium: true, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-                return res.json({ success: true, processed: true, event: eventName, premiumPreserved: true, gracePeriodDays: 60, recoveryPeriodDays: 0, gracePeriodEndsAtMillis: graceEndMillis });
+
+                const siblings = await db.collection("subscriptions").where("uid", "==", uid).get();
+                const hasAnotherPaidSubscription = siblings.docs.some((doc) => {
+                    if (doc.id === subscriptionId) return false;
+                    const sibling = doc.data() || {};
+                    const status = String(sibling.status || "").toLowerCase();
+                    return ["active", "authenticated"].includes(status) &&
+                        sibling.paymentRecoveryRequired !== true &&
+                        sibling.premiumAccessRevoked !== true;
+                });
+                if (!hasAnotherPaidSubscription) {
+                    await userRef.set({
+                        isPremium: false,
+                        plan: "FREE",
+                        subscriptionStatus: subscriptionStatus || "pending",
+                        updatedAt: FieldValue.serverTimestamp(),
+                    }, { merge: true });
+                }
+                return res.json({
+                    success: true,
+                    processed: true,
+                    event: eventName,
+                    premiumActive: hasAnotherPaidSubscription,
+                    paymentRecoveryRequired: true,
+                    message: "Payment failed; Premium requires a successful payment.",
+                });
             }
 
             if (eventName === "subscription.halted") {
-                const nowMillis = Date.now();
-                const existingGraceStart = existingData.gracePeriodStartedAt?.toMillis?.() || 0;
-                const existingGraceEnd = existingData.gracePeriodEndsAt?.toMillis?.() || 0;
-                const graceStillOpen = existingData.gracePeriodActive === true && existingGraceEnd > nowMillis;
+                update.paymentFailed = true;
+                update.paymentRecoveryRequired = true;
+                update.gracePeriodActive = false;
+                update.gracePeriodStartedAt = null;
+                update.gracePeriodEndsAt = null;
+                update.recoveryPeriodActive = false;
+                update.recoveryPeriodStartedAt = null;
+                update.recoveryPeriodEndsAt = null;
+                update.premiumAccessRevoked = true;
+                await subscriptionRef.set(update, { merge: true });
 
-                if (
-                    existingData.premiumAccessRevoked === true ||
-                    existingData.recoveryPeriodExpired === true ||
-                    (existingGraceEnd > 0 && existingGraceEnd <= nowMillis)
-                ) {
-                    await subscriptionRef.set({
-                        ...update,
-                        paymentFailed: true,
-                        gracePeriodActive: false,
-                        recoveryPeriodActive: false,
-                        recoveryPeriodStartedAt: null,
-                        recoveryPeriodEndsAt: null,
-                        premiumAccessRevoked: true,
+                const siblings = await db.collection("subscriptions").where("uid", "==", uid).get();
+                const hasAnotherPaidSubscription = siblings.docs.some((doc) => {
+                    if (doc.id === subscriptionId) return false;
+                    const sibling = doc.data() || {};
+                    const status = String(sibling.status || "").toLowerCase();
+                    return ["active", "authenticated"].includes(status) &&
+                        sibling.paymentRecoveryRequired !== true &&
+                        sibling.premiumAccessRevoked !== true;
+                });
+                if (!hasAnotherPaidSubscription) {
+                    await userRef.set({
+                        isPremium: false,
+                        plan: "FREE",
+                        subscriptionStatus: "halted",
+                        updatedAt: FieldValue.serverTimestamp(),
                     }, { merge: true });
-                    return res.json({ success: true, processed: true, event: eventName, premiumPreserved: false, recoveryPeriodDays: 0, reason: "GRACE_PERIOD_ENDED" });
                 }
-
-                const graceStartMillis = graceStillOpen && existingGraceStart ? existingGraceStart : nowMillis;
-                const graceEndMillis = graceStillOpen && existingGraceEnd
-                    ? existingGraceEnd
-                    : graceStartMillis + 60 * 24 * 60 * 60 * 1000;
-                await subscriptionRef.set({
-                    ...update,
-                    paymentFailed: true,
-                    gracePeriodActive: true,
-                    gracePeriodStartedAt: Timestamp.fromMillis(graceStartMillis),
-                    gracePeriodEndsAt: Timestamp.fromMillis(graceEndMillis),
-                    recoveryPeriodActive: false,
-                    recoveryPeriodStartedAt: null,
-                    recoveryPeriodEndsAt: null,
-                    recoveryPeriodExpired: false,
-                    premiumAccessRevoked: false,
-                }, { merge: true });
-                await userRef.set({ isPremium: true, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
-                return res.json({ success: true, processed: true, event: eventName, premiumPreserved: true, gracePeriodDays: 60, recoveryPeriodDays: 0, gracePeriodEndsAtMillis: graceEndMillis });
+                return res.json({
+                    success: true,
+                    processed: true,
+                    event: eventName,
+                    premiumActive: hasAnotherPaidSubscription,
+                    paymentRecoveryRequired: true,
+                    message: "Razorpay subscription is halted; customer payment recovery is required.",
+                });
             }
 
             if (
@@ -2639,16 +2663,12 @@ if (actualChargedAmount !== expectedRenewalAmount) {
     eventName === "subscription.expired"
 ) {
     update.status = subscriptionStatus;
-    // Terminal lifecycle events are not payment failures or recovery-period expiry.
-    update.paymentFailed = false;
     update.gracePeriodActive = false;
-    update.gracePeriodStartedAt = null;
-    update.gracePeriodEndsAt = null;
     update.recoveryPeriodActive = false;
-    update.recoveryPeriodStartedAt = null;
-    update.recoveryPeriodEndsAt = null;
-    update.recoveryPeriodEndedAt = null;
-    update.recoveryPeriodExpired = false;
+    update.recoveryPeriodEndedAt = FieldValue.serverTimestamp();
+    update.recoveryPeriodExpired = true;
+    update.paymentRecoveryRequired = false;
+    update.paymentFailed = false;
     update.premiumAccessRevoked = true;
 
     const activeSubscriptionsSnapshot = await db
@@ -2703,83 +2723,15 @@ if (actualChargedAmount !== expectedRenewalAmount) {
 );
 
 /*
- * --------------------------------------------------------------------------
- * Subscription Grace-Period Expiry (POST /cron/process-subscription-grace-periods)
- * Call this endpoint daily from a trusted scheduler using CRON_SECRET.
- * --------------------------------------------------------------------------
+ * Subscription grace/recovery cron is intentionally not used in the
+ * successful-payment-only Premium policy. Premium is restored by a verified
+ * successful subscription charge webhook, not by a timer.
  */
 app.post("/cron/process-subscription-grace-periods", async (req, res) => {
-    try {
-        const cronSecret = process.env.CRON_SECRET || "";
-        const suppliedSecret = req.headers["x-cron-secret"] || String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
-        if (!cronSecret) return res.status(503).json({ success: false, message: "CRON_SECRET is not configured" });
-        if (!suppliedSecret || !safeEqualHex(
-            crypto.createHash("sha256").update(String(suppliedSecret)).digest("hex"),
-            crypto.createHash("sha256").update(String(cronSecret)).digest("hex")
-        )) return res.status(401).json({ success: false, message: "Unauthorized" });
-
-        const nowMillis = Date.now();
-        const allSnapshot = await db.collection("subscriptions").get();
-        let graceEnded = 0;
-        let recoveryExpired = 0;
-        let usersRevoked = 0;
-
-        for (const doc of allSnapshot.docs) {
-            let data = doc.data() || {};
-            if (!data.uid) continue;
-            const graceEnd = data.gracePeriodEndsAt?.toMillis?.() || 0;
-            const graceExpired = data.gracePeriodActive === true && graceEnd > 0 && graceEnd <= nowMillis;
-            // Recovery windows from a previous build are closed immediately under the new 0-day policy.
-            const legacyRecoveryMustClose = data.recoveryPeriodActive === true;
-            if (!graceExpired && !legacyRecoveryMustClose) continue;
-
-            const freshSnapshot = await doc.ref.get();
-            if (!freshSnapshot.exists) continue;
-            data = freshSnapshot.data() || {};
-            const freshGraceEnd = data.gracePeriodEndsAt?.toMillis?.() || 0;
-            const stillGraceExpired = data.gracePeriodActive === true && freshGraceEnd > 0 && freshGraceEnd <= Date.now();
-            const stillLegacyRecovery = data.recoveryPeriodActive === true;
-            if (!stillGraceExpired && !stillLegacyRecovery) continue;
-
-            await doc.ref.set({
-                gracePeriodActive: false,
-                gracePeriodEndedAt: stillGraceExpired ? FieldValue.serverTimestamp() : (data.gracePeriodEndedAt || null),
-                recoveryPeriodActive: false,
-                recoveryPeriodStartedAt: null,
-                recoveryPeriodEndsAt: null,
-                recoveryPeriodEndedAt: FieldValue.serverTimestamp(),
-                recoveryPeriodExpired: true,
-                premiumAccessRevoked: true,
-                updatedAt: FieldValue.serverTimestamp(),
-            }, { merge: true });
-            if (stillGraceExpired) graceEnded += 1;
-            if (stillLegacyRecovery) recoveryExpired += 1;
-
-            const siblings = await db.collection("subscriptions").where("uid", "==", data.uid).get();
-            const hasOtherPremium = siblings.docs.some(otherDoc => {
-                if (otherDoc.id === doc.id) return false;
-                const other = otherDoc.data() || {};
-                const status = String(other.status || "").toLowerCase();
-                return !other.premiumAccessRevoked && (
-                    ["active", "authenticated", "pending"].includes(status) ||
-                    (other.gracePeriodActive === true && (other.gracePeriodEndsAt?.toMillis?.() || 0) > Date.now())
-                );
-            });
-            if (!hasOtherPremium) {
-                await db.collection("users").doc(data.uid).set({
-                    isPremium: false,
-                    plan: "FREE",
-                    subscriptionStatus: data.status || "halted",
-                    updatedAt: FieldValue.serverTimestamp(),
-                }, { merge: true });
-                usersRevoked += 1;
-            }
-        }
-        return res.status(200).json({ success: true, gracePeriodsEnded: graceEnded, recoveryPeriodsExpired: recoveryExpired, usersRevoked, recoveryPeriodDays: 0, checkedAtMillis: Date.now() });
-    } catch (error) {
-        console.error("Subscription Grace/Recovery Period Error:", error);
-        return res.status(500).json({ success: false, message: "Subscription grace-period processing failed" });
-    }
+    return res.status(410).json({
+        success: false,
+        message: "Grace-period cron is disabled. Premium requires successful payment.",
+    });
 });
 
 /*
